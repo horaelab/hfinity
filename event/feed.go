@@ -98,6 +98,9 @@ func (f *Feed) typecheck(typ reflect.Type) bool {
 		f.etype = typ
 		return true
 	}
+	if f.etype.String() == "interface {}" {
+		return true
+	}
 	return f.etype == typ
 }
 

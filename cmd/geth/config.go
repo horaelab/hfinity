@@ -34,6 +34,9 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	whisper "github.com/ethereum/go-ethereum/whisper/whisperv6"
 	"github.com/naoina/toml"
+	"net/http"
+	_ "net/http/pprof"
+	"runtime"
 )
 
 var (
@@ -154,6 +157,12 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 	stack, cfg := makeConfigNode(ctx)
 
 	utils.RegisterEthService(stack, &cfg.Eth)
+
+	//Enable web profiling
+	if ctx.GlobalBool(utils.ProfilingFlag.Name) {
+		runtime.SetMutexProfileFraction(10)
+		go http.ListenAndServe(fmt.Sprintf("0.0.0.0:%d", ctx.GlobalInt(utils.ProfilingPortFlag.Name)), nil)
+	}
 
 	if ctx.GlobalBool(utils.DashboardEnabledFlag.Name) {
 		utils.RegisterDashboardService(stack, &cfg.Dashboard, gitCommit)

@@ -469,7 +469,7 @@ func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool
 		evmux         = new(event.TypeMux)
 		pow           = ethash.NewFaker()
 		db            = ethdb.NewMemDatabase()
-		config        = &params.ChainConfig{DAOForkBlock: big.NewInt(1), DAOForkSupport: localForked}
+		config        = &params.ChainConfig{DAOForkBlock: big.NewInt(1), DAOForkSupport: localForked, BufferDepth: big.NewInt(1), GroupSize: big.NewInt(3), GroupThreshold: big.NewInt(2), EpochLength: big.NewInt(16)}
 		gspec         = &core.Genesis{Config: config}
 		genesis       = gspec.MustCommit(db)
 		blockchain, _ = core.NewBlockChain(db, nil, config, pow, vm.Config{})
@@ -496,7 +496,7 @@ func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool
 	}
 	// Create a block to reply to the challenge if no timeout is simulated
 	if !timeout {
-		blocks, _ := core.GenerateChain(&params.ChainConfig{}, genesis, ethash.NewFaker(), db, 1, func(i int, block *core.BlockGen) {
+		blocks, _ := core.GenerateChain(params.MainnetChainConfig, genesis, ethash.NewFaker(), db, 1, func(i int, block *core.BlockGen) {
 			if remoteForked {
 				block.SetExtra(params.DAOForkBlockExtra)
 			}

@@ -121,12 +121,13 @@ func (t *rlpx) close(err error) {
 	t.fd.Close()
 }
 
-func (t *rlpx) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err error) {
+func (t *rlpx) doProtoHandshake(our *protoHandshake, temporary bool) (their *protoHandshake, err error) {
 	// Writing our handshake happens concurrently, we prefer
 	// returning the handshake read error. If the remote side
 	// disconnects us early with a valid reason, we should return it
 	// as the error so it can be tracked elsewhere.
 	werr := make(chan error, 1)
+	our.Temporary = temporary
 	go func() { werr <- Send(t.rw, handshakeMsg, our) }()
 	if their, err = readProtocolHandshake(t.rw, our); err != nil {
 		<-werr // make sure the write terminates too

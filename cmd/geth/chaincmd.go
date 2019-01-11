@@ -203,6 +203,16 @@ func initGenesis(ctx *cli.Context) error {
 		}
 		log.Info("Successfully wrote genesis state", "database", name, "hash", hash)
 	}
+	// TODO: to remove this. save replica info in the chaindata.
+	replicadb, err := stack.OpenDatabase("replica", 0, 0)
+	if err != nil {
+		utils.Fatalf("Failed to open database: %v", err)
+	}
+	genesis.CommitReplicaDB(replicadb)
+	if err != nil {
+		utils.Fatalf("Failed to write genesis block: %v", err)
+	}
+	log.Info("Successfully wrote genesis state", "database", "replica")
 	return nil
 }
 

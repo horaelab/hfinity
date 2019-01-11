@@ -49,3 +49,11 @@ type ChainSideEvent struct {
 }
 
 type ChainHeadEvent struct{ Block *types.Block }
+
+type BlockConfirmedEvent struct {
+	Header *types.Header
+}
+
+type BlockInsertedEvent struct {
+	Block *types.Block
+}

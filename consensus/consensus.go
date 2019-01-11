@@ -23,6 +23,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -47,6 +50,12 @@ type ChainReader interface {
 
 	// GetBlock retrieves a block from the database by hash and number.
 	GetBlock(hash common.Hash, number uint64) *types.Block
+
+	CalcReplicaRating(round uint64, address common.Address) uint64
+
+	GetGroupWithBeacon(beacon horaetypes.RandomBeacon) *replica.Group
+
+	ReplicaDb() ethdb.Database
 }
 
 // Engine is an algorithm agnostic consensus engine.

@@ -40,6 +40,14 @@ var customGenesisTests = []struct {
 			"mixhash"    : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"timestamp"  : "0x00"
+			"config"     : {
+				"bufferDepth": 5,
+    			"epochLength": 16,
+    			"groupSize":   3,
+				"fixedGroupNum": 5,
+    			"groupThreshold": 2,
+    			"replicaThreshold": 2
+			}
 		}`,
 		query:  "eth.getBlock(0).nonce",
 		result: "0x0000000000000042",
@@ -56,7 +64,14 @@ var customGenesisTests = []struct {
 			"mixhash"    : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 			"timestamp"  : "0x00",
-			"config"     : {}
+			"config"     : {
+				"bufferDepth": 5,
+    			"epochLength": 16,
+				"fixedGroupNum": 5,
+    			"groupSize":   3,
+    			"groupThreshold": 2,
+    			"replicaThreshold": 2
+			}
 		}`,
 		query:  "eth.getBlock(0).nonce",
 		result: "0x0000000000000042",
@@ -76,7 +91,13 @@ var customGenesisTests = []struct {
 			"config"     : {
 				"homesteadBlock" : 314,
 				"daoForkBlock"   : 141,
-				"daoForkSupport" : true
+				"daoForkSupport" : true,
+				"bufferDepth": 5,
+    			"epochLength": 16,
+    			"groupSize":   3,
+				"fixedGroupNum": 5,
+    			"groupThreshold": 2,
+    			"replicaThreshold": 2
 			}
 		}`,
 		query:  "eth.getBlock(0).nonce",

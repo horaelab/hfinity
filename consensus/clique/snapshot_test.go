@@ -28,6 +28,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -73,6 +75,18 @@ func (ap *testerAccountPool) address(account string) common.Address {
 // block. All other methods and requests will panic.
 type testerChainReader struct {
 	db ethdb.Database
+}
+
+func (r *testerChainReader) CalcReplicaRating(round uint64, address common.Address) uint64 {
+	panic("implement me")
+}
+
+func (r *testerChainReader) GetGroupWithBeacon(beacon horaetypes.RandomBeacon) *replica.Group {
+	panic("implement me")
+}
+
+func (r *testerChainReader) ReplicaDb() ethdb.Database {
+	panic("implement me")
 }
 
 func (r *testerChainReader) Config() *params.ChainConfig                 { return params.AllCliqueProtocolChanges }

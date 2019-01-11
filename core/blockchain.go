@@ -18,11 +18,11 @@
 package core
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
-	mrand "math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +37,9 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
+	"github.com/ethereum/go-ethereum/horae/random-beacon/bls"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
@@ -90,9 +93,10 @@ type BlockChain struct {
 	chainConfig *params.ChainConfig // Chain & network configuration
 	cacheConfig *CacheConfig        // Cache configuration for pruning
 
-	db     ethdb.Database // Low level persistent database to store final content in
-	triegc *prque.Prque   // Priority queue mapping block numbers to tries to gc
-	gcproc time.Duration  // Accumulates canonical block processing for trie dumping
+	db        ethdb.Database // Low level persistent database to store final content in
+	replicaDb ethdb.Database
+	triegc    *prque.Prque  // Priority queue mapping block numbers to tries to gc
+	gcproc    time.Duration // Accumulates canonical block processing for trie dumping
 
 	hc            *HeaderChain
 	rmLogsFeed    event.Feed
@@ -100,6 +104,7 @@ type BlockChain struct {
 	chainSideFeed event.Feed
 	chainHeadFeed event.Feed
 	logsFeed      event.Feed
+	dfinityFeed   event.Feed
 	scope         event.SubscriptionScope
 	genesisBlock  *types.Block
 
@@ -129,12 +134,18 @@ type BlockChain struct {
 	vmConfig  vm.Config
 
 	badBlocks *lru.Cache // Bad block cache
+
+	latestRandomBeacon *horaetypes.RandomBeacon
+	rbFeed             event.Feed
+	prbMap             map[common.Address]*horaetypes.PartialRandomBeacon
+	lastUpdateTime     time.Time
+	rbMutex            sync.Mutex
+	pendingQueue       *prque.Prque
+	pendingQueueLock   sync.Mutex
+	coinbase           common.Address
 }
 
-// NewBlockChain returns a fully initialised block chain using information
-// available in the database. It initialises the default Ethereum Validator and
-// Processor.
-func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) {
+func NewBC(db ethdb.Database, replicaDb ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) {
 	if cacheConfig == nil {
 		cacheConfig = &CacheConfig{
 			TrieNodeLimit: 256 * 1024 * 1024,
@@ -146,11 +157,11 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	blockCache, _ := lru.New(blockCacheLimit)
 	futureBlocks, _ := lru.New(maxFutureBlocks)
 	badBlocks, _ := lru.New(badBlockLimit)
-
 	bc := &BlockChain{
 		chainConfig:  chainConfig,
 		cacheConfig:  cacheConfig,
 		db:           db,
+		replicaDb:    replicaDb,
 		triegc:       prque.New(),
 		stateCache:   state.NewDatabase(db),
 		quit:         make(chan struct{}),
@@ -161,6 +172,8 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		engine:       engine,
 		vmConfig:     vmConfig,
 		badBlocks:    badBlocks,
+		prbMap:       make(map[common.Address]*horaetypes.PartialRandomBeacon),
+		pendingQueue: prque.New(),
 	}
 	bc.SetValidator(NewBlockValidator(chainConfig, bc, engine))
 	bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine))
@@ -177,6 +190,19 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	if err := bc.loadLastState(); err != nil {
 		return nil, err
 	}
+
+	//Restore random beacon from DB
+	if replicaDb != nil {
+		rbRound := replica.ReadLatestRandomBeaconRound(replicaDb)
+		rbBody := replica.ReadRandomBeacon(replicaDb, rbRound)
+		rb := &horaetypes.RandomBeacon{
+			Data:  rbBody,
+			Round: rbRound,
+		}
+		bc.latestRandomBeacon = rb
+		bc.lastUpdateTime = time.Now()
+	}
+
 	// Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain
 	for hash := range BadHashes {
 		if header := bc.GetHeaderByHash(hash); header != nil {
@@ -192,7 +218,25 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	}
 	// Take ownership of this particular state
 	go bc.update()
+	if bc.replicaDb != nil {
+		go bc.insertLoop()
+	}
 	return bc, nil
+}
+
+// NewBlockChain returns a fully initialised block chain using information
+// available in the database. It initialises the default Ethereum Validator and
+// Processor.
+func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) {
+	return NewBC(db, nil, cacheConfig, chainConfig, engine, vmConfig)
+}
+
+func (bc *BlockChain) ReplicaDb() ethdb.Database {
+	return bc.replicaDb
+}
+
+func (bc *BlockChain) SetReplicaDb(db ethdb.Database) {
+	bc.replicaDb = db
 }
 
 func (bc *BlockChain) getProcInterrupt() bool {
@@ -881,7 +925,6 @@ func (bc *BlockChain) WriteBlockWithoutState(block *types.Block, td *big.Int) (e
 func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (status WriteStatus, err error) {
 	bc.wg.Add(1)
 	defer bc.wg.Done()
-
 	// Calculate the total difficulty of the block
 	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
 	if ptd == nil {
@@ -891,6 +934,7 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	log.Info("[Horae] Important - Write block to db with state.", "block", block.Hash(), "number", block.NumberU64())
 	currentBlock := bc.CurrentBlock()
 	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
 	externTd := new(big.Int).Add(block.Difficulty(), ptd)
@@ -902,7 +946,6 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	// Write other block data using a batch.
 	batch := bc.db.NewBatch()
 	rawdb.WriteBlock(batch, block)
-
 	root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number()))
 	if err != nil {
 		return NonStatTy, err
@@ -960,11 +1003,13 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	reorg := externTd.Cmp(localTd) > 0
 	currentBlock = bc.CurrentBlock()
-	if !reorg && externTd.Cmp(localTd) == 0 {
+	reorg := block.NumberU64() > currentBlock.NumberU64()
+	reorg = reorg || (block.NumberU64() == currentBlock.NumberU64() && externTd.Cmp(localTd) > 0)
+	reorg = reorg || (block.NumberU64() == currentBlock.NumberU64() && block.Difficulty().Cmp(currentBlock.Difficulty()) > 0)
+	if !reorg && block.NumberU64() == currentBlock.NumberU64() && block.Difficulty().Cmp(currentBlock.Difficulty()) == 0 {
 		// Split same-difficulty blocks by number, then at random
-		reorg = block.NumberU64() < currentBlock.NumberU64() || (block.NumberU64() == currentBlock.NumberU64() && mrand.Float64() < 0.5)
+		log.Error("Reorg confused.", "currentBlock", currentBlock.Hash(), "newBlock", block.Hash())
 	}
 	if reorg {
 		// Reorganise the chain if the parent is not the head block
@@ -984,7 +1029,15 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	if err := batch.Write(); err != nil {
 		return NonStatTy, err
 	}
-
+	if block.NumberU64() > bc.Config().BufferDepth.Uint64() && block.NumberU64() == currentBlock.NumberU64()+1 {
+		bufferDepth := bc.Config().BufferDepth.Uint64()
+		ancestorHash, num := bc.GetAncestorWithoutLock(block.Hash(), block.NumberU64(), bufferDepth, &bufferDepth)
+		ancestor := bc.GetBlockByNumber(num)
+		if ancestor == nil || ancestor.Hash() != ancestorHash {
+			return NonStatTy, errors.New("failed to get ancestor block to be confirmed")
+		}
+		bc.doConfirm(ancestor)
+	}
 	// Set new head.
 	if status == CanonStatTy {
 		bc.insert(block)
@@ -1000,9 +1053,63 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 //
 // After insertion is done, all accumulated events will be fired.
 func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
+	if bc.replicaDb != nil {
+		bc.pendingQueueLock.Lock()
+		defer bc.pendingQueueLock.Unlock()
+		for _, block := range chain {
+			if !bc.HasBlock(block.Hash(), block.NumberU64()) {
+				bc.pendingQueue.Push(block, -float32(block.NumberU64()))
+			}
+		}
+		return len(chain), nil
+	}
+
 	n, events, logs, err := bc.insertChain(chain)
 	bc.PostChainEvents(events, logs)
 	return n, err
+}
+
+func (bc *BlockChain) insertLoop() {
+	for {
+		if bc.pendingQueue.Empty() {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		bc.pendingQueueLock.Lock()
+		blocks := make(map[string]*types.Block)
+		block := bc.pendingQueue.PopItem().(*types.Block)
+		height := block.NumberU64()
+
+		for block.NumberU64() == height {
+			if blocks[block.Hash().String()] == nil {
+				blocks[block.Hash().String()] = block
+			}
+			if bc.pendingQueue.Empty() {
+				break
+			}
+			block = bc.pendingQueue.PopItem().(*types.Block)
+		}
+		if block.NumberU64() != height {
+			bc.pendingQueue.Push(block, -float32(block.NumberU64()))
+		}
+		bc.pendingQueueLock.Unlock()
+		log.Info("Start insert blocks.", "height", height, "len", len(blocks))
+		wg := &sync.WaitGroup{}
+		wg.Add(len(blocks))
+		for _, b := range blocks {
+			go func(insertBlock *types.Block) {
+				defer wg.Done()
+				_, events, logs, err := bc.insertChain(types.Blocks{insertBlock})
+				bc.PostChainEvents(events, logs)
+				if err != nil {
+					log.Info("Insert chain failed.", "number", insertBlock.NumberU64(), "block", insertBlock.Hash(), "rating", insertBlock.Rating(), "from", insertBlock.Coinbase(), "err", err)
+				}
+
+			}(b)
+		}
+		wg.Wait()
+		log.Info("Complete handling insert blocks.", "height", height, "len", len(blocks))
+	}
 }
 
 // insertChain will execute the actual chain insertion and event aggregation. The
@@ -1070,6 +1177,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		bstart := time.Now()
 
 		err := <-results
+		if err == nil {
+			err = bc.engine.VerifyHeader(bc, block.Header(), seals[i])
+		}
 		if err == nil {
 			err = bc.Validator().ValidateBody(block)
 		}
@@ -1182,7 +1292,6 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		case SideStatTy:
 			log.Debug("Inserted forked block", "number", block.Number(), "hash", block.Hash(), "diff", block.Difficulty(), "elapsed",
 				common.PrettyDuration(time.Since(bstart)), "txs", len(block.Transactions()), "gas", block.GasUsed(), "uncles", len(block.Uncles()))
-
 			blockInsertTimer.UpdateSince(bstart)
 			events = append(events, ChainSideEvent{block})
 		}
@@ -1320,6 +1429,19 @@ func (bc *BlockChain) reorg(oldBlock, newBlock *types.Block) error {
 			return fmt.Errorf("Invalid new chain")
 		}
 	}
+
+	if len(oldChain) > 1 {
+		//In dfinity, it indicates a potential error.
+		log.Warn("[Horae] Reorg: Detect dfinity huge reorg.")
+		log.Warn("[Horae] Reorg: old chain info. ", "len", len(oldChain))
+		for _, block := range oldChain {
+			log.Warn("[Horae] Reorg: old block info.", "block", block.Hash(), "rating", block.Rating())
+		}
+		for _, block := range newChain {
+			log.Warn("[Horae] Reorg: new block info.", "block", block.Hash(), "rating", block.Rating())
+		}
+	}
+
 	// Ensure the user sees large reorgs
 	if len(oldChain) > 0 && len(newChain) > 0 {
 		logFn := log.Debug
@@ -1382,12 +1504,13 @@ func (bc *BlockChain) PostChainEvents(events []interface{}, logs []*types.Log) {
 
 		case ChainSideEvent:
 			bc.chainSideFeed.Send(ev)
+
 		}
 	}
 }
 
 func (bc *BlockChain) update() {
-	futureTimer := time.NewTicker(5 * time.Second)
+	futureTimer := time.NewTicker(200 * time.Millisecond)
 	defer futureTimer.Stop()
 	for {
 		select {
@@ -1543,6 +1666,11 @@ func (bc *BlockChain) GetAncestor(hash common.Hash, number, ancestor uint64, max
 	return bc.hc.GetAncestor(hash, number, ancestor, maxNonCanonical)
 }
 
+func (bc *BlockChain) GetAncestorWithoutLock(hash common.Hash, number, ancestor uint64, maxNonCanonical *uint64) (common.Hash, uint64) {
+
+	return bc.hc.GetAncestor(hash, number, ancestor, maxNonCanonical)
+}
+
 // GetHeaderByNumber retrieves a block header from the database by number,
 // caching it (associated with its hash) if found.
 func (bc *BlockChain) GetHeaderByNumber(number uint64) *types.Header {
@@ -1578,4 +1706,547 @@ func (bc *BlockChain) SubscribeChainSideEvent(ch chan<- ChainSideEvent) event.Su
 // SubscribeLogsEvent registers a subscription of []*types.Log.
 func (bc *BlockChain) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription {
 	return bc.scope.Track(bc.logsFeed.Subscribe(ch))
+}
+
+// SubscribeChainEvent registers a subscription of FailedSigEvent.
+func (bc *BlockChain) SubscribeDfinityEvent(ch chan<- interface{}) event.Subscription {
+	return bc.scope.Track(bc.dfinityFeed.Subscribe(ch))
+}
+
+// Post Dfinity events
+func (bc *BlockChain) PostDfinityEvent(event interface{}) {
+	bc.dfinityFeed.Send(event)
+}
+
+func (bc *BlockChain) SubscribeRbEvent(ch chan<- interface{}) event.Subscription {
+	return bc.scope.Track(bc.rbFeed.Subscribe(ch))
+}
+
+func (bc *BlockChain) PostRbEvent(event interface{}) {
+	bc.rbFeed.Send(event)
+}
+
+func (bc *BlockChain) SetCoinbase(coinbase common.Address) {
+	bc.coinbase = coinbase
+}
+
+func (bc *BlockChain) Lock() {
+	bc.chainmu.Lock()
+}
+
+func (bc *BlockChain) UnLock() {
+	bc.chainmu.Unlock()
+}
+
+func (bc *BlockChain) CheckEpoch(height uint64) bool {
+	return height != 0 && height%bc.chainConfig.EpochLength.Uint64() == 0
+}
+
+//Please make sure the partial random beacon is valid before adding it
+func (bc *BlockChain) AddPartialRandomBeacon(prb *horaetypes.PartialRandomBeacon) error {
+	bc.rbMutex.Lock()
+	defer bc.rbMutex.Unlock()
+
+	//if bc.rbSyncing {
+	//	return fmt.Errorf("Waiting for syncing. ")
+	//}
+
+	if prb.Round != bc.latestRandomBeacon.Round+1 {
+		return fmt.Errorf("Incorrect round for partial random beacon. ")
+	}
+
+	for _, v := range bc.prbMap {
+		if v.Round != prb.Round {
+			bc.prbMap = make(map[common.Address]*horaetypes.PartialRandomBeacon)
+			log.Info("Clean out dated partial random beacon map.")
+			break
+		}
+	}
+
+	bc.prbMap[prb.From] = prb
+	bc.PostRbEvent(*prb)
+
+	if len(bc.prbMap) >= int(bc.Config().GroupThreshold.Int64()) {
+		//Aggregate all signature and set the latest random beacon
+		signatures := make(map[common.Address]bls.Signature)
+		for k, v := range bc.prbMap {
+			signatures[k] = bls.SignatureFromBytes(v.Data)
+		}
+		groupSignature := bls.RecoverSignatureByMap(signatures, int(bc.Config().GroupThreshold.Int64()))
+		newBeacon := &horaetypes.RandomBeacon{
+			Round: bc.latestRandomBeacon.Round + 1,
+			Data:  groupSignature.Bytes(),
+		}
+		bc.moveBeaconForward(newBeacon, true)
+	}
+
+	return nil
+}
+
+func (bc *BlockChain) GetCurrentRandomBeacon() horaetypes.RandomBeacon {
+	if bc.replicaDb == nil {
+		return horaetypes.RandomBeacon{
+			Data:  []byte("DESPITE IT SINCE YOU DO NOT HAVE A REPLICA DB."),
+			Round: bc.CurrentBlock().NumberU64() + 1,
+		}
+	}
+	return *bc.latestRandomBeacon
+}
+
+func (bc *BlockChain) AddRandomBeacon(rb *horaetypes.RandomBeacon) error {
+	bc.rbMutex.Lock()
+	defer bc.rbMutex.Unlock()
+
+	bc.moveBeaconForward(rb, true)
+	return nil
+
+}
+
+func (bc *BlockChain) ValidateRandomBeacon(rb *horaetypes.RandomBeacon) bool {
+	if rb == nil {
+		return false
+	}
+	lastBeacon := horaetypes.RandomBeacon{
+		Data:  replica.ReadRandomBeacon(bc.replicaDb, rb.Round-1),
+		Round: rb.Round - 1,
+	}
+	return bc.validateRandomBeacon(*rb, lastBeacon)
+}
+
+func (bc *BlockChain) validateRandomBeacon(rb horaetypes.RandomBeacon, lastBeacon horaetypes.RandomBeacon) bool {
+	group := bc.GetGroupWithBeacon(lastBeacon)
+	if group != nil {
+		return bls.VerifySignature(group.GroupPubKey, lastBeacon.Data, rb.Data)
+	}
+	bootReplica := replica.ReadBootReplica(bc.replicaDb)
+	if bootReplica != nil {
+		return bls.VerifySignature(bootReplica.PublicKey, lastBeacon.Data, rb.Data)
+	}
+	return false
+}
+
+func (bc *BlockChain) ValidateRandomBeacons(rbs []horaetypes.RandomBeacon) bool {
+	if !bc.ValidateRandomBeacon(&rbs[0]) {
+		return false
+	}
+	for i := 1; i < len(rbs); i++ {
+		if !bc.validateRandomBeacon(rbs[i], rbs[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (bc *BlockChain) ValidatePartialRandomBeacon(prb *horaetypes.PartialRandomBeacon) bool {
+	lastBeacon := horaetypes.RandomBeacon{
+		Data:  replica.ReadRandomBeacon(bc.replicaDb, prb.Round-1),
+		Round: prb.Round - 1,
+	}
+	signer := replica.ReadReplicaFromAddress(bc.replicaDb, prb.From)
+	if signer == nil {
+		return false
+	}
+	if group := bc.GetGroupWithBeacon(lastBeacon); group != nil {
+		for i, mem := range group.Members {
+			if mem == prb.From {
+				return bls.VerifySignature(group.MemPubKeys[i], lastBeacon.Data, prb.Data)
+			}
+		}
+	}
+	return false
+}
+
+func (bc *BlockChain) AddRandomBeacons(rbs []horaetypes.RandomBeacon) error {
+	bc.rbMutex.Lock()
+	defer bc.rbMutex.Unlock()
+
+	for i, _ := range rbs {
+		newBeacon := rbs[i]
+		if newBeacon.Round <= bc.latestRandomBeacon.Round {
+			continue
+		}
+		if !bc.moveBeaconForward(&newBeacon, i == len(rbs)-1) {
+			log.Error("invalid random beacon", "round", newBeacon.Round)
+			break
+		}
+	}
+	return nil
+}
+
+func (bc *BlockChain) GetGroupWithBeacon(beacon horaetypes.RandomBeacon) *replica.Group {
+	block := bc.getAncestorBlock(beacon.Round)
+	if block == nil {
+		log.Error("Can not get block for beacon.", "round", beacon.Round)
+		return nil
+	}
+	groupNum := bc.chainConfig.FixedGroupNum.Uint64()
+	randSeed := bls.RandFromBytes(beacon.Data).Ders("HoraeGroup")
+	ids := randSeed.RandomPerm(int(groupNum), int(groupNum))
+	for _, id := range ids {
+		if group := replica.ReadGroupWithIndex(bc.replicaDb, uint64(id), block.Epoch()-1); group != nil && group.Failed {
+			return group
+		}
+	}
+	return nil
+}
+
+func (bc *BlockChain) CalcReplicaRating(round uint64, address common.Address) uint64 {
+	beaconBytes := replica.ReadRandomBeacon(bc.ReplicaDb(), round)
+	block := bc.getAncestorBlock(round)
+	if block == nil {
+		log.Error("Can not get block for beacon.", "round", round)
+		return 0
+	}
+	replicaNum := block.Header().ReplicaNum
+
+	if replicaNum == 0 {
+		bootreplica := replica.ReadBootReplica(bc.ReplicaDb())
+		if bootreplica != nil && bootreplica.Address == address {
+			return 1
+		}
+	}
+	r := replica.ReadReplicaFromAddress(bc.ReplicaDb(), address)
+	if r == nil || r.Id == 0 {
+		return 0
+	}
+	randSeed := bls.RandFromBytes(beaconBytes)
+	minerSize := bc.Config().ReplicaThreshold.Uint64()
+	if replicaNum < bc.Config().ReplicaThreshold.Uint64() {
+		minerSize = replicaNum
+	}
+	ids := randSeed.RandomPerm(int(replicaNum), int(minerSize))
+	for i := 0; i < len(ids); i++ {
+		if ids[i] == int(r.Id) {
+			return minerSize - uint64(i)
+		}
+	}
+	return 0
+}
+
+func (bc *BlockChain) getAncestorBlock(round uint64) *types.Block {
+	var blockNum uint64 = 0
+	if round > bc.Config().BufferDepth.Uint64()+2 {
+		blockNum = round - bc.Config().BufferDepth.Uint64() - 2
+	}
+	return bc.GetBlockByNumber(blockNum)
+}
+
+func (bc *BlockChain) moveBeaconForward(beacon *horaetypes.RandomBeacon, needEvent bool) bool {
+	if beacon.Round == bc.latestRandomBeacon.Round+1 {
+		replica.WriteRandomBeacon(bc.ReplicaDb(), beacon.Round, beacon.Data)
+		bc.latestRandomBeacon = beacon
+		bc.lastUpdateTime = time.Now()
+		if needEvent {
+			bc.PostRbEvent(*beacon)
+		}
+		return true
+	}
+
+	if needEvent && beacon.Round == bc.latestRandomBeacon.Round && time.Since(bc.lastUpdateTime) > time.Duration(bc.chainConfig.BlockTime.Int64())*time.Second {
+		bc.lastUpdateTime = time.Now()
+		bc.PostRbEvent(*beacon)
+	}
+	return false
+}
+
+func (bc *BlockChain) GetUnconfirmedGroupShareReport(parentHash common.Hash) map[uint64][]*replica.GroupShareReport {
+	parentBlock := bc.GetBlockByHash(parentHash)
+	epoch := parentBlock.Epoch()
+	reportMap := make(map[uint64][]*replica.GroupShareReport)
+	for parentBlock.NumberU64() > 0 && parentBlock.Epoch() == epoch {
+		for _, tx := range parentBlock.Transactions() {
+			switch tx.Type() {
+			case types.TRANSACTION_TYPE_GROUP_SHARE_REPORT:
+				report := replica.DeserializeGroupShareReport(tx.Data())
+				if report.Epoch != epoch {
+					continue
+				}
+				if reportMap[report.GroupIndex] == nil {
+					reportMap[report.GroupIndex] = make([]*replica.GroupShareReport, 0, bc.Config().GroupSize.Uint64())
+				}
+				reportMap[report.GroupIndex] = append(reportMap[report.GroupIndex], report)
+			}
+		}
+		parentBlock = bc.GetBlockByHash(parentBlock.ParentHash())
+	}
+	return reportMap
+}
+
+func (bc *BlockChain) GetUnconfirmedReplica(parentHash common.Hash) map[common.Address]*replica.Replica {
+	parentBlock := bc.GetBlockByHash(parentHash)
+	epoch := parentBlock.Epoch()
+	replicaMap := make(map[common.Address]*replica.Replica)
+	for parentBlock.NumberU64() > 0 && parentBlock.Epoch() == epoch {
+		for _, tx := range parentBlock.Transactions() {
+			switch tx.Type() {
+			case types.TRANSACTION_TYPE_NEW_NODE:
+				unconfirmedReplica := replica.DeserializeReplica(tx.Data())
+				r := replica.ReadReplicaFromAddress(bc.replicaDb, unconfirmedReplica.Address)
+				if r == nil || r.Id == 0 {
+					replicaMap[r.Address] = r
+				}
+			}
+		}
+		parentBlock = bc.GetBlockByHash(parentBlock.ParentHash())
+	}
+	return replicaMap
+}
+
+func (bc *BlockChain) doConfirm(block *types.Block) {
+	if block == nil {
+		return
+	}
+
+	isEpoch := bc.CheckEpoch(block.NumberU64())
+
+	log.Info("🔗 block reached canonical chain", "number", block.NumberU64(), "hash", block.Hash())
+	// Add info first
+	for _, tx := range block.Transactions() {
+		isLocal := tx.Type()>>7 == 1
+		if !isLocal || isEpoch {
+			switch tx.Type() {
+			case types.TRANSACTION_TYPE_NEW_NODE:
+				r := replica.DeserializeReplica(tx.Data())
+				if replica.ReadReplicaFromAddress(bc.replicaDb, r.Address) == nil {
+					r.Id = 0
+					replica.WriteReplicaAddress(bc.ReplicaDb(), r)
+					log.Info("[HORAE CONFIRMED] Confirmed new node transaction.", "replicaAddr", r.Address.Hex())
+				}
+			case types.TRANSACTION_TYPE_JOINED_NODE:
+				r := replica.DeserializeReplica(tx.Data())
+				replica.WriteReplica(bc.ReplicaDb(), r)
+				log.Info("[HORAE CONFIRMED] Confirmed join node transaction.", "replicaAddr", r.Address.Hex(), "replicaId", r.Id)
+			case types.TRANSACTION_TYPE_BUILD_GROUP:
+				groupInfo := replica.DeserializeGroup(tx.Data())
+				if groupInfo.Epoch != block.Epoch() {
+					log.Info("Get invalid group build tx", "groupEpoch", groupInfo.Epoch, "blockEpoch", block.Epoch(), "blockNum", block.NumberU64())
+					continue
+				}
+				replica.WriteGroupInfoWithId(bc.ReplicaDb(), groupInfo)
+				for _, v := range groupInfo.Members {
+					if v == bc.coinbase {
+						bc.PostDfinityEvent(replica.BuildGroupEvent{Body: groupInfo})
+						log.Info("It's my group, post an event for starting build process. ")
+						break
+					}
+				}
+				log.Info("[HORAE CONFIRMED] Confirmed build group transaction.", "groupIndex", groupInfo.Index, "groupMem", len(groupInfo.Members), "groupAddress", groupInfo.Address.Hex())
+			case types.TRANSACTION_TYPE_PREPARED_GROUP:
+				group := replica.DeserializeGroup(tx.Data())
+				if group.Epoch != block.Epoch()-1 {
+					log.Info("Get invalid group prepared tx", "groupEpoch", group.Epoch, "blockEpoch", block.Epoch(), "blockNum", block.NumberU64())
+					continue
+				}
+				replica.WriteGroupWithId(bc.ReplicaDb(), group)
+				for _, v := range group.Members {
+					if v == bc.coinbase {
+						bc.PostDfinityEvent(replica.PreparedGroupEvent{Body: group})
+						log.Info("It's my group, it is ready now.")
+					}
+				}
+				log.Info("[HORAE CONFIRMED] Confirmed prepared group transaction.", "groupIndex", group.Index, "groupMem", len(group.Members), "groupAddress", group.Address.Hex(), "Failed", group.Failed)
+			}
+		}
+	}
+}
+
+func (bc *BlockChain) GenerateGroupsInfo(header *types.Header, oldReplicaNum uint64, newReplicas map[uint64]*replica.Replica) map[uint64]*replica.Group {
+	groups := make(map[uint64]*replica.Group)
+	groupSize := bc.Config().GroupSize.Uint64()
+	if header.ReplicaNum < groupSize {
+		return groups
+	}
+	groupNum := bc.Config().FixedGroupNum.Uint64()
+	beacon := replica.ReadRandomBeacon(bc.replicaDb, header.Number.Uint64()-1)
+
+	for i := uint64(1); i <= groupNum; i++ {
+		ids := bls.RandFromBytes(beacon).Deri(int(i)).RandomPerm(int(header.ReplicaNum), int(groupSize))
+		members := make([]common.Address, 0, len(ids))
+		for _, id := range ids {
+			id := uint64(id)
+			var r *replica.Replica
+			if id <= oldReplicaNum {
+				r = replica.ReadReplicaFromId(bc.ReplicaDb(), id)
+			} else {
+				r = newReplicas[id]
+			}
+			members = append(members, r.Address)
+		}
+		randomIdBytes := make([]byte, 20)
+		rand.Read(randomIdBytes)
+
+		group := &replica.Group{
+			Index:   i,
+			Members: members,
+			Address: common.BytesToAddress(randomIdBytes),
+			Epoch:   header.Epoch,
+		}
+		groups[i] = group
+	}
+	return groups
+}
+
+func (bc *BlockChain) BuildGroup(groupIndex uint64, epoch uint64, shareReports []*replica.GroupShareReport) *replica.Group {
+	group := replica.ReadGroupInfoWithIndex(bc.replicaDb, groupIndex, epoch)
+
+	if group == nil {
+		log.Error("failed to get group info.", "index", groupIndex)
+		return nil
+	}
+
+	//Short cut for insufficient number of share reports, set the group as failed
+	if uint64(len(shareReports)) < bc.chainConfig.GroupThreshold.Uint64() {
+		group.Failed = false
+		return group
+	}
+
+	//Transform share reports from list to map
+	reportMap := make(map[common.Address]*replica.GroupShareReport)
+	for i, _ := range shareReports {
+		report := shareReports[i]
+		if len(report.ReceivedPubKeys) != len(group.Members) || len(report.SharePubKeys) != len(group.Members) {
+			continue
+		}
+		valid := true
+		for index, _ := range group.Members {
+			if len(report.ReceivedPubKeys[index]) == 0 && len(report.Signatures[index]) == 0 {
+				continue
+			}
+			if len(report.ReceivedPubKeys[index]) == 0 || len(report.Signatures[index]) == 0 {
+				valid = false
+				break
+			}
+			if !bls.VerifySignature(report.ReceivedPubKeys[index], []byte("HORAE"), report.Signatures[index]) {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			reportMap[shareReports[i].From] = shareReports[i]
+		}
+	}
+
+	for rIndex, receiver := range group.Members {
+		if reportMap[receiver] == nil {
+			continue
+		}
+		invalidMembers := make([]common.Address, 0)
+		for sIndex, sender := range group.Members {
+			if reportMap[sender] == nil || len(reportMap[receiver].ReceivedPubKeys[sIndex]) == 0 || common.Bytes2Hex(reportMap[receiver].ReceivedPubKeys[sIndex]) != common.Bytes2Hex(reportMap[sender].SharePubKeys[rIndex]) {
+				invalidMembers = append(invalidMembers, sender)
+			}
+		}
+		reportMap[receiver].InvalidMembers = invalidMembers
+	}
+
+	//Count invalid votes
+	voteMap := make(map[common.Address]map[common.Address]bool)
+	invalidVotes := make(map[common.Address]uint64)
+	invalidMembersNum := make(map[common.Address]uint64)
+	invalidMembers := make(map[common.Address]bool)
+	for _, member := range group.Members {
+		report := reportMap[member]
+		if report == nil {
+			invalidMembersNum[member] = uint64(len(group.Members))
+			continue
+		}
+		voteMap[member] = make(map[common.Address]bool)
+		invalidMembersNum[member] = uint64(len(report.InvalidMembers))
+		for _, invalidMember := range report.InvalidMembers {
+			voteMap[member][invalidMember] = true
+			invalidVotes[invalidMember] = invalidVotes[invalidMember] + 1
+		}
+	}
+	for {
+		maxInvalidVotes := uint64(0)
+		var removeAddr common.Address
+		maxInvalidMemberSize := uint64(0)
+		var removeAddr1 common.Address
+		for _, mem := range group.Members {
+			if invalidVotes[mem] > maxInvalidVotes {
+				maxInvalidVotes = invalidVotes[mem]
+				removeAddr = mem
+			}
+			if invalidMembersNum[mem] > maxInvalidMemberSize {
+				maxInvalidMemberSize = invalidMembersNum[mem]
+				removeAddr1 = mem
+			}
+		}
+		if maxInvalidVotes+maxInvalidMemberSize == 0 {
+			break
+		}
+		var invalidAddr common.Address
+		if maxInvalidVotes > maxInvalidMemberSize {
+			invalidAddr = removeAddr
+		} else {
+			invalidAddr = removeAddr1
+		}
+		invalidMembers[invalidAddr] = true
+		for member, mapper := range voteMap {
+			if mapper[invalidAddr] && invalidMembersNum[member] > 0 {
+				invalidMembersNum[member]--
+			}
+		}
+		for member, bl := range voteMap[invalidAddr] {
+			if bl && invalidVotes[member] > 0 {
+				invalidVotes[member]--
+			}
+		}
+		invalidVotes[invalidAddr] = 0
+		invalidMembersNum[invalidAddr] = 0
+
+	}
+
+	if uint64(len(invalidMembers)) >= bc.chainConfig.GroupThreshold.Uint64() {
+		group.Failed = false
+		return group
+	}
+
+	//Get all valid member and aggregate their publicKeys
+	validMembers := make([]common.Address, 0, bc.Config().GroupSize.Uint64())
+	validMemberIndexMap := make(map[common.Address]uint64)
+
+	for i, sender := range group.Members {
+		if invalidMembers[sender] {
+			continue
+		}
+		sigMap := make(map[common.Address]bls.Signature, 0)
+		for _, receiver := range group.Members {
+			if !invalidMembers[receiver] {
+				sigMap[receiver] = bls.SignatureFromBytes(reportMap[receiver].Signatures[i])
+			}
+		}
+		if bls.VerifySignature(reportMap[sender].GroupPubKey, []byte("HORAE"), bls.RecoverSignatureByMap(sigMap, len(sigMap)).Bytes()) {
+			validMembers = append(validMembers, sender)
+			validMemberIndexMap[sender] = uint64(i)
+		}
+	}
+
+	if len(validMembers) == 0 {
+		group.Failed = false
+		return group
+	}
+
+	pubKeyList := make([][]byte, 0)
+	for _, mem := range validMembers {
+		list := make([]bls.Pubkey, 0)
+		for _, index := range validMemberIndexMap {
+			list = append(list, bls.BytesToPubkey(reportMap[mem].ReceivedPubKeys[index]))
+		}
+		pubKeyList = append(pubKeyList, bls.AggregatePubkeys(list).Bytes())
+	}
+
+	//Aggeregate group public key
+	publicKeys := make([]bls.Pubkey, 0, len(validMembers))
+	for _, member := range validMembers {
+		publicKeys = append(publicKeys, bls.BytesToPubkey(reportMap[member].GroupPubKey))
+	}
+	groupPublicKey := bls.AggregatePubkeys(publicKeys)
+
+	group.Members = validMembers
+	group.GroupPubKey = groupPublicKey.Bytes()
+	group.MemPubKeys = pubKeyList
+	group.Failed = uint64(len(validMembers)) >= bc.chainConfig.GroupThreshold.Uint64()
+
+	return group
 }

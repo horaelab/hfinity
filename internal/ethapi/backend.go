@@ -19,6 +19,7 @@ package ethapi
 
 import (
 	"context"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -44,6 +45,7 @@ type Backend interface {
 	ChainDb() ethdb.Database
 	EventMux() *event.TypeMux
 	AccountManager() *accounts.Manager
+	BufferDepth() int
 
 	// BlockChain API
 	SetHead(number uint64)
@@ -51,6 +53,8 @@ type Backend interface {
 	BlockByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*types.Block, error)
 	StateAndHeaderByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*state.StateDB, *types.Header, error)
 	GetBlock(ctx context.Context, blockHash common.Hash) (*types.Block, error)
+	GetRandomBeacon(ctx context.Context, round uint64) (*horaetypes.RandomBeacon, error)
+	GetCurrentBeacon(ctx context.Context) (*horaetypes.RandomBeacon, error)
 	GetReceipts(ctx context.Context, blockHash common.Hash) (types.Receipts, error)
 	GetTd(blockHash common.Hash) *big.Int
 	GetEVM(ctx context.Context, msg core.Message, state *state.StateDB, header *types.Header, vmCfg vm.Config) (*vm.EVM, func() error, error)

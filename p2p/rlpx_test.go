@@ -180,7 +180,7 @@ func TestProtocolHandshake(t *testing.T) {
 			return
 		}
 
-		phs, err := rlpx.doProtoHandshake(hs0)
+		phs, err := rlpx.doProtoHandshake(hs0, false)
 		if err != nil {
 			t.Errorf("dial side proto handshake error: %v", err)
 			return
@@ -206,7 +206,7 @@ func TestProtocolHandshake(t *testing.T) {
 			return
 		}
 
-		phs, err := rlpx.doProtoHandshake(hs1)
+		phs, err := rlpx.doProtoHandshake(hs1, false)
 		if err != nil {
 			t.Errorf("listen side proto handshake error: %v", err)
 			return

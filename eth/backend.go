@@ -25,7 +25,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"crypto/ecdsa"
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -36,19 +38,25 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/horae/consensus"
+	"github.com/ethereum/go-ethereum/horae/miner"
+	"github.com/ethereum/go-ethereum/horae/random-beacon/bls"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
+	"net"
 )
 
 type LesServer interface {
@@ -73,7 +81,8 @@ type Ethereum struct {
 	lesServer       LesServer
 
 	// DB interfaces
-	chainDb ethdb.Database // Block chain database
+	chainDb   ethdb.Database // Block chain database
+	replicaDb ethdb.Database //Replica database
 
 	eventMux       *event.TypeMux
 	engine         consensus.Engine
@@ -90,6 +99,8 @@ type Ethereum struct {
 
 	networkID     uint64
 	netRPCService *ethapi.PublicNetAPI
+	node          *discover.Node
+	ipAddress     net.IP
 
 	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
 }
@@ -112,6 +123,10 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
+	replicadb, err := CreateDB(ctx, config, "replica")
+	if err != nil {
+		return nil, err
+	}
 	chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis)
 	if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil && !ok {
 		return nil, genesisErr
@@ -121,16 +136,18 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	eth := &Ethereum{
 		config:         config,
 		chainDb:        chainDb,
+		replicaDb:      replicadb,
 		chainConfig:    chainConfig,
 		eventMux:       ctx.EventMux,
 		accountManager: ctx.AccountManager,
-		engine:         CreateConsensusEngine(ctx, &config.Ethash, chainConfig, chainDb),
 		shutdownChan:   make(chan bool),
 		networkID:      config.NetworkId,
 		gasPrice:       config.GasPrice,
 		etherbase:      config.Etherbase,
 		bloomRequests:  make(chan chan *bloombits.Retrieval),
 		bloomIndexer:   NewBloomIndexer(chainDb, params.BloomBitsBlocks),
+		ipAddress:      net.ParseIP(config.IPAddress),
+		engine:         CreateConsensusEngine(ctx, &config.Ethash, chainConfig, chainDb),
 	}
 
 	log.Info("Initialising Ethereum protocol", "versions", ProtocolVersions, "network", config.NetworkId)
@@ -146,7 +163,7 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 		vmConfig    = vm.Config{EnablePreimageRecording: config.EnablePreimageRecording}
 		cacheConfig = &core.CacheConfig{Disabled: config.NoPruning, TrieNodeLimit: config.TrieCache, TrieTimeLimit: config.TrieTimeout}
 	)
-	eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, eth.chainConfig, eth.engine, vmConfig)
+	eth.blockchain, err = core.NewBC(chainDb, replicadb, cacheConfig, eth.chainConfig, eth.engine, vmConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +214,10 @@ func makeExtraData(extra []byte) []byte {
 	return extra
 }
 
+func (eth *Ethereum) SetNode(node *discover.Node) {
+	eth.node = node
+}
+
 // CreateDB creates the chain database.
 func CreateDB(ctx *node.ServiceContext, config *Config, name string) (ethdb.Database, error) {
 	db, err := ctx.OpenDatabase(name, config.DatabaseCache, config.DatabaseHandles)
@@ -227,15 +248,7 @@ func CreateConsensusEngine(ctx *node.ServiceContext, config *ethash.Config, chai
 		log.Warn("Ethash used in shared mode")
 		return ethash.NewShared()
 	default:
-		engine := ethash.New(ethash.Config{
-			CacheDir:       ctx.ResolvePath(config.CacheDir),
-			CachesInMem:    config.CachesInMem,
-			CachesOnDisk:   config.CachesOnDisk,
-			DatasetDir:     config.DatasetDir,
-			DatasetsInMem:  config.DatasetsInMem,
-			DatasetsOnDisk: config.DatasetsOnDisk,
-		})
-		engine.SetThreads(-1) // Disable CPU mining
+		engine := dfinity.New()
 		return engine
 	}
 }
@@ -333,12 +346,47 @@ func (s *Ethereum) SetEtherbase(etherbase common.Address) {
 	s.miner.SetEtherbase(etherbase)
 }
 
-func (s *Ethereum) StartMining(local bool) error {
+func (s *Ethereum) GetProtoManager() *ProtocolManager {
+	return s.protocolManager
+}
+
+func (s *Ethereum) StartMining(local bool, password string) error {
+
 	eb, err := s.Etherbase()
+
 	if err != nil {
 		log.Error("Cannot start mining without etherbase", "err", err)
 		return fmt.Errorf("etherbase missing: %v", err)
 	}
+	ks := s.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
+
+	key, err := ks.GetKey(eb, password)
+
+	if err != nil {
+		return fmt.Errorf("failed to get private key : %v", err)
+	}
+	secRand := bls.RandFromBytes(crypto.FromECDSA(key.PrivateKey))
+
+	s.miner.SetKey(key.PrivateKey)
+
+	r := replica.ReadReplicaFromAddress(s.ReplicaDb(), eb)
+
+	node := discover.NewNode(s.node.ID, s.ipAddress, s.node.UDP, s.node.TCP)
+
+	if r == nil {
+
+		rep := replica.Replica{
+			Address:   eb,
+			PublicKey: bls.PubkeyFromSeckey(bls.SeckeyFromRand(secRand)).Bytes(),
+			NodeId:    fmt.Sprintf("%x", s.node.ID.Bytes()[:8]),
+			Enode:     node.String(),
+		}
+
+		if err := s.AddNewNodeTx(rep, key.PrivateKey); err != nil {
+			return fmt.Errorf("failed to add replica transaction into txPool: %v", err)
+		}
+	}
+
 	if clique, ok := s.engine.(*clique.Clique); ok {
 		wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
 		if wallet == nil || err != nil {
@@ -358,6 +406,36 @@ func (s *Ethereum) StartMining(local bool) error {
 	return nil
 }
 
+func (eth *Ethereum) AddNewNodeTx(r replica.Replica, key *ecdsa.PrivateKey) error {
+
+	state := eth.TxPool().State()
+
+	nonce := state.GetNonce(eth.etherbase)
+
+	data, _ := rlp.EncodeToBytes(r)
+
+	tx := types.NewTx(nonce, new(big.Int), 2100000, new(big.Int), data, types.TRANSACTION_TYPE_NEW_NODE)
+
+	var (
+		transaction *types.Transaction
+		err         error
+	)
+
+	chainID := eth.ChainID()
+	// Depending on the presence of the chain ID, sign with EIP155 or homestead
+	if chainID != nil {
+		transaction, err = types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	} else {
+		transaction, err = types.SignTx(tx, types.HomesteadSigner{}, key)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to sign tx with passphrase: %v", err)
+	}
+	eth.TxPool().AddLocal(transaction)
+	return nil
+}
+
 func (s *Ethereum) StopMining()         { s.miner.Stop() }
 func (s *Ethereum) IsMining() bool      { return s.miner.Mining() }
 func (s *Ethereum) Miner() *miner.Miner { return s.miner }
@@ -368,10 +446,14 @@ func (s *Ethereum) TxPool() *core.TxPool               { return s.txPool }
 func (s *Ethereum) EventMux() *event.TypeMux           { return s.eventMux }
 func (s *Ethereum) Engine() consensus.Engine           { return s.engine }
 func (s *Ethereum) ChainDb() ethdb.Database            { return s.chainDb }
+func (s *Ethereum) ReplicaDb() ethdb.Database          { return s.replicaDb }
+func (s *Ethereum) ChainID() *big.Int                  { return s.APIBackend.ChainConfig().ChainID }
 func (s *Ethereum) IsListening() bool                  { return true } // Always listening
 func (s *Ethereum) EthVersion() int                    { return int(s.protocolManager.SubProtocols[0].Version) }
 func (s *Ethereum) NetVersion() uint64                 { return s.networkID }
 func (s *Ethereum) Downloader() *downloader.Downloader { return s.protocolManager.downloader }
+func (s *Ethereum) IPAddr() net.IP                     { return s.ipAddress }
+func (s *Ethereum) BufferDepth() int                   { return int(s.chainConfig.BufferDepth.Uint64()) }
 
 // Protocols implements node.Service, returning all the currently configured
 // network protocols to start.

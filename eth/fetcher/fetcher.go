@@ -67,6 +67,8 @@ type chainInsertFn func(types.Blocks) (int, error)
 // peerDropFn is a callback type for dropping a peer detected as malicious.
 type peerDropFn func(id string)
 
+type rbHeightFn func() uint64
+
 // announce is the hash notification of the availability of a new block in the
 // network.
 type announce struct {
@@ -136,6 +138,7 @@ type Fetcher struct {
 	chainHeight    chainHeightFn      // Retrieves the current chain's height
 	insertChain    chainInsertFn      // Injects a batch of blocks into the chain
 	dropPeer       peerDropFn         // Drops a peer for misbehaving
+	rbHeight       rbHeightFn
 
 	// Testing hooks
 	announceChangeHook func(common.Hash, bool) // Method to call upon adding or deleting a hash from the announce list
@@ -146,7 +149,7 @@ type Fetcher struct {
 }
 
 // New creates a block fetcher to retrieve blocks based on hash announcements.
-func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertChain chainInsertFn, dropPeer peerDropFn) *Fetcher {
+func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertChain chainInsertFn, dropPeer peerDropFn, rbHeight rbHeightFn) *Fetcher {
 	return &Fetcher{
 		notify:         make(chan *announce),
 		inject:         make(chan *inject),
@@ -169,6 +172,7 @@ func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBloc
 		chainHeight:    chainHeight,
 		insertChain:    insertChain,
 		dropPeer:       dropPeer,
+		rbHeight:       rbHeight,
 	}
 }
 
@@ -290,6 +294,7 @@ func (f *Fetcher) loop() {
 		}
 		// Import any queued blocks that could potentially fit
 		height := f.chainHeight()
+		rbHeight := f.rbHeight()
 		for !f.queue.Empty() {
 			op := f.queue.PopItem().(*inject)
 			hash := op.block.Hash()
@@ -298,11 +303,12 @@ func (f *Fetcher) loop() {
 			}
 			// If too high up the chain or phase, continue later
 			number := op.block.NumberU64()
-			if number > height+1 {
+			if number > height+1 || number > rbHeight {
 				f.queue.Push(op, -float32(number))
 				if f.queueChangeHook != nil {
 					f.queueChangeHook(hash, true)
 				}
+				fetchTimer.Reset(arriveTimeout)
 				break
 			}
 			// Otherwise if fresh and still unknown, try and import
@@ -639,7 +645,7 @@ func (f *Fetcher) insert(peer string, block *types.Block) {
 	hash := block.Hash()
 
 	// Run the import on a new thread
-	log.Debug("Importing propagated block", "peer", peer, "number", block.Number(), "hash", hash)
+	log.Info("Importing propagated block", "peer", peer, "number", block.Number(), "hash", hash)
 	go func() {
 		defer func() { f.done <- hash }()
 
@@ -667,7 +673,7 @@ func (f *Fetcher) insert(peer string, block *types.Block) {
 		}
 		// Run the actual import and log any issues
 		if _, err := f.insertChain(types.Blocks{block}); err != nil {
-			log.Debug("Propagated block import failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
+			log.Warn("Propagated block import failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
 			return
 		}
 		// If import succeeded, broadcast the block

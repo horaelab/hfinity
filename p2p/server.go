@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discv5"
@@ -174,10 +175,16 @@ type Server struct {
 	removetrusted chan *discover.Node
 	posthandshake chan *conn
 	addpeer       chan *conn
+	processmsg    chan *conn
 	delpeer       chan peerDrop
 	loopWG        sync.WaitGroup // loop, listenLoop
 	peerFeed      event.Feed
 	log           log.Logger
+	p2pMsgHandler func(p *Peer, writer MsgReadWriter)
+}
+
+func (srv *Server) InitP2pMsgHandler(handler func(p *Peer, writer MsgReadWriter)) {
+	srv.p2pMsgHandler = handler
 }
 
 type peerOpFunc func(map[discover.NodeID]*Peer)
@@ -195,6 +202,7 @@ const (
 	staticDialedConn
 	inboundConn
 	trustedConn
+	temporaryConn
 )
 
 // conn wraps a network connection with information gathered
@@ -212,7 +220,7 @@ type conn struct {
 type transport interface {
 	// The two handshakes.
 	doEncHandshake(prv *ecdsa.PrivateKey, dialDest *discover.Node) (discover.NodeID, error)
-	doProtoHandshake(our *protoHandshake) (*protoHandshake, error)
+	doProtoHandshake(our *protoHandshake, temporary bool) (*protoHandshake, error)
 	// The MsgReadWriter can only be used after the encryption
 	// handshake has completed. The code uses conn.id to track this
 	// by setting it to a non-nil value after the encryption handshake.
@@ -258,13 +266,18 @@ func (c *conn) is(f connFlag) bool {
 }
 
 func (c *conn) set(f connFlag, val bool) {
-	flags := connFlag(atomic.LoadInt32((*int32)(&c.flags)))
-	if val {
-		flags |= f
-	} else {
-		flags &= ^f
+	for {
+		oldFlags := connFlag(atomic.LoadInt32((*int32)(&c.flags)))
+		flags := oldFlags
+		if val {
+			flags |= f
+		} else {
+			flags &= ^f
+		}
+		if atomic.CompareAndSwapInt32((*int32)(&c.flags), int32(oldFlags), int32(flags)) {
+			return
+		}
 	}
-	atomic.StoreInt32((*int32)(&c.flags), int32(flags))
 }
 
 // Peers returns all connected peers.
@@ -438,6 +451,7 @@ func (srv *Server) Start() (err error) {
 	}
 	srv.quit = make(chan struct{})
 	srv.addpeer = make(chan *conn)
+	srv.processmsg = make(chan *conn)
 	srv.delpeer = make(chan peerDrop)
 	srv.posthandshake = make(chan *conn)
 	srv.addstatic = make(chan *discover.Node)
@@ -538,6 +552,35 @@ func (srv *Server) Start() (err error) {
 	go srv.run(dialer)
 	srv.running = true
 	return nil
+}
+
+func (srv *Server) StartTempConnLoop(tempPeerCh chan *replica.TempPeerRequest) {
+	for {
+		select {
+		case msg := <-tempPeerCh:
+			if rw, err := srv.getTempConn(msg); err != nil {
+				msg.Err <- err
+			} else {
+				msg.MsgRW <- rw
+			}
+		case <-srv.quit:
+			return
+		}
+	}
+}
+
+func (srv *Server) getTempConn(msg *replica.TempPeerRequest) (*MsgReadWriter, error) {
+	node := discover.MustParseNode(msg.To)
+	fd, err := srv.Dialer.Dial(node)
+	if err != nil {
+		return nil, &dialError{err}
+	}
+	mfd := newMeteredConn(fd, false)
+	rw, err := srv.SetupTempConn(mfd, temporaryConn, node)
+	if err != nil {
+		mfd.Close()
+	}
+	return &rw, err
 }
 
 func (srv *Server) startListening() error {
@@ -678,14 +721,14 @@ running:
 			}
 			// TODO: track in-progress inbound node IDs (pre-Peer) to avoid dialing them.
 			select {
-			case c.cont <- srv.encHandshakeChecks(peers, inboundCount, c):
+			case c.cont <- srv.encHandshakeChecks(peers, true, inboundCount, c):
 			case <-srv.quit:
 				break running
 			}
 		case c := <-srv.addpeer:
 			// At this point the connection is past the protocol handshake.
 			// Its capabilities are known and the remote identity is verified.
-			err := srv.protoHandshakeChecks(peers, inboundCount, c)
+			err := srv.protoHandshakeChecks(peers, false, inboundCount, c)
 			if err == nil {
 				// The handshakes are done and it passed all checks.
 				p := newPeer(c, srv.Protocols)
@@ -701,6 +744,33 @@ running:
 				if p.Inbound() {
 					inboundCount++
 				}
+			}
+			// The dialer logic relies on the assumption that
+			// dial tasks complete after the peer has been added or
+			// discarded. Unblock the task last.
+			select {
+			case c.cont <- err:
+			case <-srv.quit:
+				break running
+			}
+		case c := <-srv.processmsg:
+			// At this point the connection is past the protocol handshake.
+			// Its capabilities are known and the remote identity is verified.
+			err := srv.protoHandshakeChecks(peers, true, inboundCount, c)
+			if err == nil {
+				// The handshakes are done and it passed all checks.
+				p := newPeer(c, srv.Protocols)
+				// If message events are enabled, pass the peerFeed
+				// to the peer
+				if srv.EnableMsgEvents {
+					p.events = &srv.peerFeed
+				}
+				name := truncateName(c.name)
+				srv.log.Debug("Adding temp p2p peer", "name", name, "addr", c.fd.RemoteAddr(), "peers", len(peers)+1)
+				if srv.EnableMsgEvents {
+					p.events = &srv.peerFeed
+				}
+				go srv.p2pMsgHandler(p, p.rw)
 			}
 			// The dialer logic relies on the assumption that
 			// dial tasks complete after the peer has been added or
@@ -744,23 +814,23 @@ running:
 	}
 }
 
-func (srv *Server) protoHandshakeChecks(peers map[discover.NodeID]*Peer, inboundCount int, c *conn) error {
+func (srv *Server) protoHandshakeChecks(peers map[discover.NodeID]*Peer, temp bool, inboundCount int, c *conn) error {
 	// Drop connections with no matching protocols.
 	if len(srv.Protocols) > 0 && countMatchingProtocols(srv.Protocols, c.caps) == 0 {
 		return DiscUselessPeer
 	}
 	// Repeat the encryption handshake checks because the
 	// peer set might have changed between the handshakes.
-	return srv.encHandshakeChecks(peers, inboundCount, c)
+	return srv.encHandshakeChecks(peers, temp, inboundCount, c)
 }
 
-func (srv *Server) encHandshakeChecks(peers map[discover.NodeID]*Peer, inboundCount int, c *conn) error {
+func (srv *Server) encHandshakeChecks(peers map[discover.NodeID]*Peer, temp bool, inboundCount int, c *conn) error {
 	switch {
 	case !c.is(trustedConn|staticDialedConn) && len(peers) >= srv.MaxPeers:
 		return DiscTooManyPeers
 	case !c.is(trustedConn) && c.is(inboundConn) && inboundCount >= srv.maxInboundConns():
 		return DiscTooManyPeers
-	case peers[c.id] != nil:
+	case peers[c.id] != nil && !temp:
 		return DiscAlreadyConnected
 	case c.id == srv.Self().ID:
 		return DiscSelf
@@ -859,6 +929,61 @@ func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Nod
 	return err
 }
 
+func (srv *Server) SetupTempConn(fd net.Conn, flags connFlag, dialDest *discover.Node) (MsgReadWriter, error) {
+	self := srv.Self()
+	if self == nil {
+		return nil, errors.New("shutdown")
+	}
+	c := &conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)}
+	return srv.setupTempConn(c, flags, dialDest)
+}
+
+func (srv *Server) setupTempConn(c *conn, flags connFlag, dialDest *discover.Node) (MsgReadWriter, error) {
+	// Prevent leftover pending conns from entering the handshake.
+	srv.lock.Lock()
+	running := srv.running
+	srv.lock.Unlock()
+	if !running {
+		return nil, errServerStopped
+	}
+	// Run the encryption handshake.
+	var err error
+	if c.id, err = c.doEncHandshake(srv.PrivateKey, dialDest); err != nil {
+		srv.log.Trace("Failed RLPx handshake", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
+		return nil, err
+	}
+	clog := srv.log.New("id", c.id, "addr", c.fd.RemoteAddr(), "conn", c.flags)
+	// For dialed connections, check that the remote public key matches.
+	if dialDest != nil && c.id != dialDest.ID {
+		clog.Trace("Dialed identity mismatch", "want", c, dialDest.ID)
+		return nil, DiscUnexpectedIdentity
+	}
+	// Run the protocol handshake
+	phs, err := c.doProtoHandshake(srv.ourHandshake, true)
+	if err != nil {
+		clog.Trace("Failed proto handshake", "err", err)
+		return nil, err
+	}
+	if phs.ID != c.id {
+		clog.Trace("Wrong devp2p handshake identity", "err", phs.ID)
+		return nil, DiscUnexpectedIdentity
+	}
+	c.caps, c.name = phs.Caps, phs.Name
+	if c.id == srv.Self().ID {
+		return nil, DiscSelf
+	}
+	// The handshakes are done and it passed all checks.
+	p := newPeer(c, srv.Protocols)
+	// If message events are enabled, pass the peerFeed
+	// to the peer
+	if srv.EnableMsgEvents {
+		p.events = &srv.peerFeed
+	}
+	newMsgEventer(p.rw, p.events, p.ID(), "eth")
+
+	return p.rw, nil
+}
+
 func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) error {
 	// Prevent leftover pending conns from entering the handshake.
 	srv.lock.Lock()
@@ -885,7 +1010,7 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) e
 		return err
 	}
 	// Run the protocol handshake
-	phs, err := c.doProtoHandshake(srv.ourHandshake)
+	phs, err := c.doProtoHandshake(srv.ourHandshake, false)
 	if err != nil {
 		clog.Trace("Failed proto handshake", "err", err)
 		return err
@@ -895,7 +1020,11 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) e
 		return DiscUnexpectedIdentity
 	}
 	c.caps, c.name = phs.Caps, phs.Name
-	err = srv.checkpoint(c, srv.addpeer)
+	if phs.Temporary {
+		err = srv.checkpoint(c, srv.processmsg)
+	} else {
+		err = srv.checkpoint(c, srv.addpeer)
+	}
 	if err != nil {
 		clog.Trace("Rejected peer", "err", err)
 		return err

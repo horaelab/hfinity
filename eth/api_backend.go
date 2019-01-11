@@ -18,6 +18,9 @@ package eth
 
 import (
 	"context"
+	"fmt"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -55,6 +58,26 @@ func (b *EthAPIBackend) CurrentBlock() *types.Block {
 func (b *EthAPIBackend) SetHead(number uint64) {
 	b.eth.protocolManager.downloader.Cancel()
 	b.eth.blockchain.SetHead(number)
+}
+
+func (b *EthAPIBackend) GetRandomBeacon(ctx context.Context, round uint64) (*horaetypes.RandomBeacon, error) {
+	data := replica.ReadRandomBeacon(b.eth.replicaDb, round)
+	if len(data) == 0 {
+		return nil, fmt.Errorf("failed to get random beacon for round %d", round)
+	}
+	return &horaetypes.RandomBeacon{
+		Round: round,
+		Data:  data,
+	}, nil
+}
+
+func (b *EthAPIBackend) GetCurrentBeacon(ctx context.Context) (*horaetypes.RandomBeacon, error) {
+	beacon := b.eth.BlockChain().GetCurrentRandomBeacon()
+	return &beacon, nil
+}
+
+func (b *EthAPIBackend) BufferDepth() int {
+	return b.eth.BufferDepth()
 }
 
 func (b *EthAPIBackend) HeaderByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*types.Header, error) {
@@ -98,7 +121,8 @@ func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, blockNr rpc.
 	if header == nil || err != nil {
 		return nil, nil, err
 	}
-	stateDb, err := b.eth.BlockChain().StateAt(header.Root)
+	block := b.eth.blockchain.GetBlockByNumber(header.Number.Uint64() - b.ChainConfig().BufferDepth.Uint64())
+	stateDb, err := b.eth.BlockChain().StateAt(block.Root())
 	return stateDb, header, err
 }
 

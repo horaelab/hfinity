@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -35,6 +34,8 @@ import (
 	"github.com/ethereum/go-ethereum/eth/fetcher"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/discover"
@@ -81,9 +82,15 @@ type ProtocolManager struct {
 	SubProtocols []p2p.Protocol
 
 	eventMux      *event.TypeMux
+	TempPeerCh    chan *replica.TempPeerRequest
 	txsCh         chan core.NewTxsEvent
 	txsSub        event.Subscription
 	minedBlockSub *event.TypeMuxSubscription
+
+	rbCh            chan interface{}
+	rbEventSub      event.Subscription
+	dfinityEventCh  chan interface{}
+	dfinityEventSub event.Subscription
 
 	// channels for fetcher, syncer, txsyncLoop
 	newPeerCh   chan *peer
@@ -91,9 +98,17 @@ type ProtocolManager struct {
 	quitSync    chan struct{}
 	noMorePeers chan struct{}
 
+	dfinityMsgCh chan *MsgWithPeer
+	ethMsgCh     chan *MsgWithPeer
+
 	// wait group is used for graceful shutdowns during downloading
 	// and processing
 	wg sync.WaitGroup
+}
+
+type MsgWithPeer struct {
+	msg  *p2p.Msg
+	peer *peer
 }
 
 // NewProtocolManager returns a new Ethereum sub protocol manager. The Ethereum sub protocol manages peers capable
@@ -101,16 +116,21 @@ type ProtocolManager struct {
 func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkID uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) {
 	// Create the protocol manager with the base fields
 	manager := &ProtocolManager{
-		networkID:   networkID,
-		eventMux:    mux,
-		txpool:      txpool,
-		blockchain:  blockchain,
-		chainconfig: config,
-		peers:       newPeerSet(),
-		newPeerCh:   make(chan *peer),
-		noMorePeers: make(chan struct{}),
-		txsyncCh:    make(chan *txsync),
-		quitSync:    make(chan struct{}),
+		networkID:      networkID,
+		eventMux:       mux,
+		txpool:         txpool,
+		blockchain:     blockchain,
+		chainconfig:    config,
+		peers:          newPeerSet(),
+		newPeerCh:      make(chan *peer),
+		TempPeerCh:     make(chan *replica.TempPeerRequest),
+		noMorePeers:    make(chan struct{}),
+		txsyncCh:       make(chan *txsync),
+		quitSync:       make(chan struct{}),
+		rbCh:           make(chan interface{}),
+		dfinityMsgCh:   make(chan *MsgWithPeer),
+		ethMsgCh:       make(chan *MsgWithPeer, 1024*32),
+		dfinityEventCh: make(chan interface{}, 1024*32),
 	}
 	// Figure out whether to allow fast sync or not
 	if mode == downloader.FastSync && blockchain.CurrentBlock().NumberU64() > 0 {
@@ -169,14 +189,19 @@ func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, ne
 	}
 	inserter := func(blocks types.Blocks) (int, error) {
 		// If fast sync is running, deny importing weird blocks
-		if atomic.LoadUint32(&manager.fastSync) == 1 {
-			log.Warn("Discarded bad propagated block", "number", blocks[0].Number(), "hash", blocks[0].Hash())
-			return 0, nil
-		}
+		//if atomic.LoadUint32(&manager.fastSync) == 1 {
+		//	log.Warn("Discarded bad propagated block", "number", blocks[0].Number(), "hash", blocks[0].Hash())
+		//	return 0, nil
+		//}
 		atomic.StoreUint32(&manager.acceptTxs, 1) // Mark initial sync done on any fetcher import
 		return manager.blockchain.InsertChain(blocks)
 	}
-	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer)
+
+	rbHeighter := func() uint64 {
+		return blockchain.GetCurrentRandomBeacon().Round
+	}
+
+	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer, rbHeighter)
 
 	return manager, nil
 }
@@ -212,9 +237,17 @@ func (pm *ProtocolManager) Start(maxPeers int) {
 	pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{})
 	go pm.minedBroadcastLoop()
 
+	pm.dfinityEventSub = pm.blockchain.SubscribeDfinityEvent(pm.dfinityEventCh)
+	go pm.dfinityEventLoop()
+
+	pm.rbEventSub = pm.blockchain.SubscribeRbEvent(pm.rbCh)
+	go pm.rbBroadcastLoop()
+
 	// start sync handlers
 	go pm.syncer()
 	go pm.txsyncLoop()
+	go pm.handleDfinityMsg()
+	go pm.handleEthMsg()
 }
 
 func (pm *ProtocolManager) Stop() {
@@ -222,6 +255,8 @@ func (pm *ProtocolManager) Stop() {
 
 	pm.txsSub.Unsubscribe()        // quits txBroadcastLoop
 	pm.minedBlockSub.Unsubscribe() // quits blockBroadcastLoop
+	pm.dfinityEventSub.Unsubscribe()
+	pm.rbEventSub.Unsubscribe()
 
 	// Quit the sync loop.
 	// After this send has completed, no new peers will be accepted.
@@ -306,10 +341,30 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	}
 	// main loop. handle incoming messages.
 	for {
-		if err := pm.handleMsg(p); err != nil {
-			p.Log().Debug("Ethereum message handling failed", "err", err)
-			return err
+		msg, e := p.rw.ReadMsg()
+		if e != nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
+		msgWithPeer := &MsgWithPeer{
+			peer: p,
+			msg:  &msg,
+		}
+		if msg.Code >= 0x20 {
+			pm.dfinityMsgCh <- msgWithPeer
+		} else {
+			pm.ethMsgCh <- msgWithPeer
+		}
+	}
+}
+
+func (pm *ProtocolManager) GetHandler() func(p *p2p.Peer, rw p2p.MsgReadWriter) {
+	return func(p *p2p.Peer, rw p2p.MsgReadWriter) {
+		peer := pm.newPeer(int(eth63), p, rw)
+		if err := pm.handleMsg(peer); err != nil {
+			log.Error("failed to process p2p message.", "err", err.Error())
+		}
+		p.Close()
 	}
 }
 
@@ -321,6 +376,11 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 	if err != nil {
 		return err
 	}
+	return pm.handleMsgNoRead(p, msg)
+}
+
+func (pm *ProtocolManager) handleMsgNoRead(p *peer, msg p2p.Msg) error {
+
 	if msg.Size > ProtocolMaxMsgSize {
 		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, ProtocolMaxMsgSize)
 	}
@@ -330,9 +390,10 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 	switch {
 	case msg.Code == StatusMsg:
 		// Status messages should never arrive after the handshake
+		log.Info("[EMPTY MESSAGE] uncontrolled status message")
 		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
 
-	// Block header query, collect the requested headers and reply
+		// Block header query, collect the requested headers and reply
 	case msg.Code == GetBlockHeadersMsg:
 		// Decode the complex header query
 		var query getBlockHeadersData
@@ -342,7 +403,6 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		hashMode := query.Origin.Hash != (common.Hash{})
 		first := true
 		maxNonCanonical := uint64(100)
-
 		// Gather headers until the fetch or network limits is reached
 		var (
 			bytes   common.StorageSize
@@ -680,8 +740,94 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			}
 			p.MarkTransaction(tx.Hash())
 		}
-		pm.txpool.AddRemotes(txs)
+		pm.txpool.AsyncAddRemotes(txs)
 
+	case msg.Code == SigRequestMsg:
+		// Retrieve and decode the propagated block
+		var request *replica.SigRequest
+		if err := msg.Decode(&request); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+		pm.blockchain.PostDfinityEvent(*request)
+
+	case msg.Code == SigResponseMsg:
+		// Retrieve and decode the propagated block
+		var response *replica.SigResponse
+		if err := msg.Decode(&response); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+		pm.blockchain.PostDfinityEvent(*response)
+
+	case msg.Code == GroupShareMsg:
+		var shareBody *replica.GroupShareEvent
+		if err := msg.Decode(&shareBody); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+		pm.blockchain.PostDfinityEvent(*shareBody)
+
+	case msg.Code == RandomBeaconMsg:
+		var rb *horaetypes.RandomBeacon
+		if err := msg.Decode(&rb); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+
+		if rb.Round > p.currentRound {
+			p.currentRound = rb.Round
+		}
+		if rb.Round > pm.blockchain.GetCurrentRandomBeacon().Round+1 {
+			return p.SendBeaconRequest(pm.blockchain.GetCurrentRandomBeacon().Round)
+		}
+		if !pm.blockchain.ValidateRandomBeacon(rb) {
+			log.Error("Invalid random beacon", "round", rb.Round)
+			return errResp(ErrInvalidBeacon, "%v", "invalid random beacon")
+		}
+		pm.blockchain.AddRandomBeacon(rb)
+	case msg.Code == PartialRandomBeaconMsg:
+		var prb *horaetypes.PartialRandomBeacon
+		if err := msg.Decode(&prb); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+
+		if prb.Round > p.currentRound+1 {
+			p.currentRound = prb.Round
+		}
+		p.MarkPartialBeacon(*prb)
+		if prb.Round > pm.blockchain.GetCurrentRandomBeacon().Round+1 {
+			return p.SendBeaconRequest(pm.blockchain.GetCurrentRandomBeacon().Round)
+		}
+		if !pm.blockchain.ValidatePartialRandomBeacon(prb) {
+			log.Error("Invalid partial random beacon", "round", prb.Round, "from", prb.From.Hex())
+			return errResp(ErrInvalidPartialBeacon, "%v", "invalid partial random beacon")
+		}
+		pm.blockchain.AddPartialRandomBeacon(prb)
+	case msg.Code == RandomBeaconRequestMsg:
+		var round uint64
+		if err := msg.Decode(&round); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+		log.Info("Get sync beacon request. ", "round", round)
+		if round > p.currentRound {
+			p.currentRound = round
+		}
+		return p.SendBeaconSequence(replica.ReadBatchRandomBeacon(pm.blockchain.ReplicaDb(), round, pm.blockchain.GetCurrentRandomBeacon().Round))
+	case msg.Code == RandomBeaconResponseMsg:
+		var rbs []horaetypes.RandomBeacon
+		if err := msg.Decode(&rbs); err != nil {
+			return errResp(ErrDecode, "%v: %v", msg, err)
+		}
+
+		if !pm.blockchain.ValidateRandomBeacons(rbs) {
+			log.Error("Invalid random beacon response")
+			return errResp(ErrInvalidBeacon, "%v", "invalid random beacons")
+		}
+		maxRound := rbs[len(rbs)-1].Round
+		log.Info("Get sync beacon response. ", "round", maxRound)
+		if maxRound > p.currentRound {
+			p.currentRound = maxRound
+		}
+		if len(rbs) != 0 && maxRound > pm.blockchain.GetCurrentRandomBeacon().Round {
+			pm.blockchain.AddRandomBeacons(rbs)
+		}
 	default:
 		return errResp(ErrInvalidMsgCode, "%v", msg.Code)
 	}
@@ -705,9 +851,9 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 			return
 		}
 		// Send the block to a subset of our peers
-		transfer := peers[:int(math.Sqrt(float64(len(peers))))]
+		transfer := peers
 		for _, peer := range transfer {
-			peer.AsyncSendNewBlock(block, td)
+			peer.SendNewBlock(block, td)
 		}
 		log.Trace("Propagated block", "hash", hash, "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 		return
@@ -740,6 +886,43 @@ func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) {
 	}
 }
 
+func (pm *ProtocolManager) sendMessage(data interface{}, to common.Address, msgType uint64) error {
+	r := replica.ReadReplicaFromAddress(pm.blockchain.ReplicaDb(), to)
+	if r == nil {
+		return errors.New("failed to get replica from db")
+	}
+
+	rw, err := pm.initConn(r.Enode)
+	if err == nil {
+		err = p2p.Send(*rw, msgType, data)
+	}
+
+	return err
+}
+
+func (pm *ProtocolManager) initConn(enode string) (*p2p.MsgReadWriter, error) {
+	err := make(chan error)
+	msgRW := make(chan interface{})
+
+	pm.TempPeerCh <- &replica.TempPeerRequest{
+		To:    enode,
+		Err:   err,
+		MsgRW: msgRW,
+	}
+
+	for {
+		select {
+		case e := <-err:
+			return nil, e
+		case in := <-msgRW:
+			rw := in.(*p2p.MsgReadWriter)
+			return rw, nil
+		default:
+			continue
+		}
+	}
+}
+
 // Mined broadcast loop
 func (pm *ProtocolManager) minedBroadcastLoop() {
 	// automatically stops if unsubscribe
@@ -751,14 +934,63 @@ func (pm *ProtocolManager) minedBroadcastLoop() {
 	}
 }
 
+func (pm *ProtocolManager) dfinityEventLoop() {
+	// automatically stops if unsubscribe
+	for {
+		select {
+		case event := <-pm.dfinityEventCh:
+			switch ev := event.(type) {
+			case replica.DfinityEvent:
+				err := pm.sendMessage(ev.Data, ev.To, ev.Typ)
+				if err != nil {
+					log.Info("Send message failed", "error", err)
+				}
+			}
+		}
+	}
+}
+
 func (pm *ProtocolManager) txBroadcastLoop() {
 	for {
 		select {
 		case event := <-pm.txsCh:
-			pm.BroadcastTxs(event.Txs)
+			txs := make([]*types.Transaction, 0)
+			for _, tx := range event.Txs {
+				if tx.Type()>>7 == 0 {
+					txs = append(txs, tx)
+				}
+			}
+			pm.BroadcastTxs(txs)
 
-		// Err() channel will be closed when unsubscribing.
+			// Err() channel will be closed when unsubscribing.
 		case <-pm.txsSub.Err():
+			return
+		}
+	}
+}
+
+func (pm *ProtocolManager) rbBroadcastLoop() {
+	for {
+		select {
+		case event := <-pm.rbCh:
+			switch rb := event.(type) {
+			case horaetypes.RandomBeacon:
+				for _, peer := range pm.peers.PeerUnderRound(rb.Round) {
+					peer.SendBeacon(rb)
+				}
+			case horaetypes.StuckRandomBeacon:
+				for _, peer := range pm.peers.PeerUnderRound(rb.Round + 1) {
+					peer.SendStuckBeacon(horaetypes.RandomBeacon{
+						Data:  rb.Data,
+						Round: rb.Round,
+					})
+				}
+			case horaetypes.PartialRandomBeacon:
+				for _, peer := range pm.peers.PeersWithoutPrb(rb) {
+					peer.SendPartialBeacon(rb)
+				}
+			}
+		case <-pm.rbEventSub.Err():
 			return
 		}
 	}
@@ -783,5 +1015,26 @@ func (pm *ProtocolManager) NodeInfo() *NodeInfo {
 		Genesis:    pm.blockchain.Genesis().Hash(),
 		Config:     pm.blockchain.Config(),
 		Head:       currentBlock.Hash(),
+	}
+}
+func (pm *ProtocolManager) handleDfinityMsg() {
+	for {
+		select {
+		case dMsg := <-pm.dfinityMsgCh:
+			pm.handleMsgNoRead(dMsg.peer, *dMsg.msg)
+		}
+	}
+}
+
+func (pm *ProtocolManager) handleEthMsg() {
+	for {
+		select {
+		case dMsg := <-pm.ethMsgCh:
+			if pm.peers.Peer(dMsg.peer.id) != nil {
+				if err := pm.handleMsgNoRead(dMsg.peer, *dMsg.msg); err != nil {
+					pm.removePeer(dMsg.peer.id)
+				}
+			}
+		}
 	}
 }

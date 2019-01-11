@@ -141,10 +141,6 @@ func (st *StateTransition) to() common.Address {
 }
 
 func (st *StateTransition) useGas(amount uint64) error {
-	if st.gas < amount {
-		return vm.ErrOutOfGas
-	}
-	st.gas -= amount
 
 	return nil
 }
@@ -174,7 +170,7 @@ func (st *StateTransition) preCheck() error {
 			return ErrNonceTooLow
 		}
 	}
-	return st.buyGas()
+	return nil
 }
 
 // TransitionDb will transition the state by applying the current message and
@@ -186,17 +182,7 @@ func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bo
 	}
 	msg := st.msg
 	sender := vm.AccountRef(msg.From())
-	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
 	contractCreation := msg.To() == nil
-
-	// Pay intrinsic gas
-	gas, err := IntrinsicGas(st.data, contractCreation, homestead)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	if err = st.useGas(gas); err != nil {
-		return nil, 0, false, err
-	}
 
 	var (
 		evm = st.evm

@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -60,6 +61,9 @@ type Genesis struct {
 	Number     uint64      `json:"number"`
 	GasUsed    uint64      `json:"gasUsed"`
 	ParentHash common.Hash `json:"parentHash"`
+
+	ReplicaNum  uint64              `json:"replicaNum"`
+	BootReplica replica.BootReplica `json:"bootReplica"`
 }
 
 // GenesisAlloc specifies the initial state that is part of the genesis block.
@@ -88,14 +92,16 @@ type GenesisAccount struct {
 
 // field type overrides for gencodec
 type genesisSpecMarshaling struct {
-	Nonce      math.HexOrDecimal64
-	Timestamp  math.HexOrDecimal64
-	ExtraData  hexutil.Bytes
-	GasLimit   math.HexOrDecimal64
-	GasUsed    math.HexOrDecimal64
-	Number     math.HexOrDecimal64
-	Difficulty *math.HexOrDecimal256
-	Alloc      map[common.UnprefixedAddress]GenesisAccount
+	Nonce       math.HexOrDecimal64
+	Timestamp   math.HexOrDecimal64
+	ExtraData   hexutil.Bytes
+	GasLimit    math.HexOrDecimal64
+	GasUsed     math.HexOrDecimal64
+	Number      math.HexOrDecimal64
+	Difficulty  *math.HexOrDecimal256
+	Alloc       map[common.UnprefixedAddress]GenesisAccount
+	ReplicaNum  math.HexOrDecimal64
+	BootReplica replica.BootReplica
 }
 
 type genesisAccountMarshaling struct {
@@ -246,6 +252,8 @@ func (g *Genesis) ToBlock(db ethdb.Database) *types.Block {
 		MixDigest:  g.Mixhash,
 		Coinbase:   g.Coinbase,
 		Root:       root,
+		ReplicaNum: g.ReplicaNum,
+		Epoch:      1,
 	}
 	if g.GasLimit == 0 {
 		head.GasLimit = params.GenesisGasLimit
@@ -281,6 +289,15 @@ func (g *Genesis) Commit(db ethdb.Database) (*types.Block, error) {
 	return block, nil
 }
 
+// Write replica info
+func (g *Genesis) CommitReplicaDB(db ethdb.Database) error {
+	bootReplica := g.BootReplica.ToReplica()
+	replica.WriteBootReplica(db, bootReplica)
+	//TODO: Config the first random beacon in genesis
+	replica.WriteRandomBeacon(db, 0, []byte("Horae"))
+	return nil
+}
+
 // MustCommit writes the genesis block and state to db, panicking on error.
 // The block is committed as the canonical head block.
 func (g *Genesis) MustCommit(db ethdb.Database) *types.Block {
@@ -306,6 +323,7 @@ func DefaultGenesisBlock() *Genesis {
 		GasLimit:   5000,
 		Difficulty: big.NewInt(17179869184),
 		Alloc:      decodePrealloc(mainnetAllocData),
+		ReplicaNum: 1,
 	}
 }
 
@@ -318,6 +336,7 @@ func DefaultTestnetGenesisBlock() *Genesis {
 		GasLimit:   16777216,
 		Difficulty: big.NewInt(1048576),
 		Alloc:      decodePrealloc(testnetAllocData),
+		ReplicaNum: 1,
 	}
 }
 

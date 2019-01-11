@@ -463,6 +463,14 @@ func (ks *KeyStore) importKey(key *Key, passphrase string) (accounts.Account, er
 	return a, nil
 }
 
+func (ks *KeyStore) GetKey(address common.Address, passphrase string) (*Key, error) {
+	a, err := ks.Find(accounts.Account{Address: address})
+	if err != nil {
+		return nil, err
+	}
+	return ks.storage.GetKey(a.Address, a.URL.Path, passphrase)
+}
+
 // Update changes the passphrase of an existing account.
 func (ks *KeyStore) Update(a accounts.Account, passphrase, newPassphrase string) error {
 	a, key, err := ks.getDecryptedKey(a, passphrase)

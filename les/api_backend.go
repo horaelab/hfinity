@@ -18,6 +18,8 @@ package les
 
 import (
 	"context"
+	"fmt"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -92,6 +94,13 @@ func (b *LesApiBackend) GetReceipts(ctx context.Context, hash common.Hash) (type
 		return light.GetBlockReceipts(ctx, b.eth.odr, hash, *number)
 	}
 	return nil, nil
+}
+
+func (b *LesApiBackend) GetRandomBeacon(ctx context.Context, round uint64) (*horaetypes.RandomBeacon, error) {
+	return nil, fmt.Errorf("random beacon is not valid for light ethereum")
+}
+func (b *LesApiBackend) GetCurrentBeacon(ctx context.Context) (*horaetypes.RandomBeacon, error) {
+	return nil, fmt.Errorf("random beacon is not valid for light ethereum")
 }
 
 func (b *LesApiBackend) GetLogs(ctx context.Context, hash common.Hash) ([][]*types.Log, error) {
@@ -185,6 +194,10 @@ func (b *LesApiBackend) EventMux() *event.TypeMux {
 
 func (b *LesApiBackend) AccountManager() *accounts.Manager {
 	return b.eth.accountManager
+}
+
+func (b *LesApiBackend) BufferDepth() int {
+	return b.eth.BufferDepth()
 }
 
 func (b *LesApiBackend) BloomStatus() (uint64, uint64) {

@@ -26,6 +26,7 @@ import (
 	mapset "github.com/deckarep/golang-set"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -37,8 +38,9 @@ var (
 )
 
 const (
-	maxKnownTxs    = 32768 // Maximum transactions hashes to keep in the known list (prevent DOS)
-	maxKnownBlocks = 1024  // Maximum block hashes to keep in the known list (prevent DOS)
+	maxKnownTxs      = 32768 // Maximum transactions hashes to keep in the known list (prevent DOS)
+	maxKnownBlocks   = 1024  // Maximum block hashes to keep in the known list (prevent DOS)
+	maxKnownRequests = 12
 
 	// maxQueuedTxs is the maximum number of transaction lists to queue up before
 	// dropping broadcasts. This is a sensitive number as a transaction list might
@@ -54,6 +56,10 @@ const (
 	// dropping broadcasts. Similarly to block propagations, there's no point to queue
 	// above some healthy uncle limit, so use that.
 	maxQueuedAnns = 4
+
+	maxSigRequests = 4
+
+	maxSigResponse = 4
 
 	handshakeTimeout = 5 * time.Second
 )
@@ -85,8 +91,12 @@ type peer struct {
 	td   *big.Int
 	lock sync.RWMutex
 
-	knownTxs    mapset.Set                // Set of transaction hashes known to be known by this peer
-	knownBlocks mapset.Set                // Set of block hashes known to be known by this peer
+	knownTxs    mapset.Set // Set of transaction hashes known to be known by this peer
+	knownBlocks mapset.Set // Set of block hashes known to be known by this peer
+
+	knownRbs     mapset.Set
+	currentRound uint64
+
 	queuedTxs   chan []*types.Transaction // Queue of transactions to broadcast to the peer
 	queuedProps chan *propEvent           // Queue of blocks to broadcast to the peer
 	queuedAnns  chan *types.Block         // Queue of blocks to announce to the peer
@@ -95,16 +105,18 @@ type peer struct {
 
 func newPeer(version int, p *p2p.Peer, rw p2p.MsgReadWriter) *peer {
 	return &peer{
-		Peer:        p,
-		rw:          rw,
-		version:     version,
-		id:          fmt.Sprintf("%x", p.ID().Bytes()[:8]),
-		knownTxs:    mapset.NewSet(),
-		knownBlocks: mapset.NewSet(),
-		queuedTxs:   make(chan []*types.Transaction, maxQueuedTxs),
-		queuedProps: make(chan *propEvent, maxQueuedProps),
-		queuedAnns:  make(chan *types.Block, maxQueuedAnns),
-		term:        make(chan struct{}),
+		Peer:         p,
+		rw:           rw,
+		version:      version,
+		id:           fmt.Sprintf("%x", p.ID().Bytes()[:8]),
+		knownTxs:     mapset.NewSet(),
+		knownBlocks:  mapset.NewSet(),
+		knownRbs:     mapset.NewSet(),
+		currentRound: 0,
+		queuedTxs:    make(chan []*types.Transaction, maxQueuedTxs),
+		queuedProps:  make(chan *propEvent, maxQueuedProps),
+		queuedAnns:   make(chan *types.Block, maxQueuedAnns),
+		term:         make(chan struct{}),
 	}
 }
 
@@ -112,14 +124,21 @@ func newPeer(version int, p *p2p.Peer, rw p2p.MsgReadWriter) *peer {
 // and transaction broadcasts into the remote peer. The goal is to have an async
 // writer that does not lock up node internals.
 func (p *peer) broadcast() {
+	txsBuffer := make([]*types.Transaction, 0)
+	tick := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
-		case txs := <-p.queuedTxs:
-			if err := p.SendTransactions(txs); err != nil {
-				return
+		case <-tick.C:
+			if len(txsBuffer) > 0 {
+				if err := p.SendTransactions(txsBuffer); err != nil {
+					p.Log().Error("Boadcast transaction failed.", "count", len(txsBuffer))
+					return
+				}
+				p.Log().Trace("Broadcast transactions", "count", len(txsBuffer))
+				txsBuffer = make([]*types.Transaction, 0)
 			}
-			p.Log().Trace("Broadcast transactions", "count", len(txs))
-
+		case txs := <-p.queuedTxs:
+			txsBuffer = append(txsBuffer, txs...)
 		case prop := <-p.queuedProps:
 			if err := p.SendNewBlock(prop.block, prop.td); err != nil {
 				return
@@ -227,6 +246,43 @@ func (p *peer) SendNewBlockHashes(hashes []common.Hash, numbers []uint64) error 
 		request[i].Number = numbers[i]
 	}
 	return p2p.Send(p.rw, NewBlockHashesMsg, request)
+}
+
+func (p *peer) SendBeacon(rb horaetypes.RandomBeacon) error {
+	if p.currentRound < rb.Round {
+		if err := p2p.Send(p.rw, RandomBeaconMsg, rb); err != nil {
+			return err
+		}
+		p.currentRound = rb.Round
+	}
+	return nil
+}
+
+func (p *peer) SendStuckBeacon(rb horaetypes.RandomBeacon) error {
+	return p2p.Send(p.rw, RandomBeaconMsg, rb)
+}
+
+func (p *peer) SendPartialBeacon(prb horaetypes.PartialRandomBeacon) error {
+	if p.currentRound < prb.Round && !p.knownRbs.Contains(prb.String()) {
+		p.MarkPartialBeacon(prb)
+		return p2p.Send(p.rw, PartialRandomBeaconMsg, prb)
+	}
+	return nil
+}
+
+func (p *peer) MarkPartialBeacon(prb horaetypes.PartialRandomBeacon) {
+	if p.knownRbs.Cardinality() >= 1000 {
+		p.knownRbs.Pop()
+	}
+	p.knownRbs.Add(prb.String())
+}
+
+func (p *peer) SendBeaconSequence(rbs []horaetypes.RandomBeacon) error {
+	return p2p.Send(p.rw, RandomBeaconResponseMsg, rbs)
+}
+
+func (p *peer) SendBeaconRequest(round uint64) error {
+	return p2p.Send(p.rw, RandomBeaconRequestMsg, round)
 }
 
 // AsyncSendNewBlockHash queues the availability of a block for propagation to a
@@ -471,6 +527,32 @@ func (ps *peerSet) PeersWithoutBlock(hash common.Hash) []*peer {
 	list := make([]*peer, 0, len(ps.peers))
 	for _, p := range ps.peers {
 		if !p.knownBlocks.Contains(hash) {
+			list = append(list, p)
+		}
+	}
+	return list
+}
+
+func (ps *peerSet) PeersWithoutPrb(prb horaetypes.PartialRandomBeacon) []*peer {
+	ps.lock.RLock()
+	defer ps.lock.RUnlock()
+
+	list := make([]*peer, 0, len(ps.peers))
+	for _, p := range ps.peers {
+		if !p.knownRbs.Contains(prb.String()) {
+			list = append(list, p)
+		}
+	}
+	return list
+}
+
+func (ps *peerSet) PeerUnderRound(round uint64) []*peer {
+	ps.lock.RLock()
+	defer ps.lock.RUnlock()
+
+	list := make([]*peer, 0, len(ps.peers))
+	for _, p := range ps.peers {
+		if p.currentRound < round {
 			list = append(list, p)
 		}
 	}

@@ -285,7 +285,7 @@ func TestReorgLongHeaders(t *testing.T) {
 // Tests that reorganizing a short difficult chain after a long easy one
 // overwrites the canonical numbers and links in the database.
 func TestReorgShortHeaders(t *testing.T) {
-	testReorg(t, []int{1, 2, 3, 4}, []int{1, 10}, 11)
+	testReorg(t, []int{1, 2, 3, 4}, []int{1, 10}, 10)
 }
 
 func testReorg(t *testing.T, first, second []int, td int64) {

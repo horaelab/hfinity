@@ -112,6 +112,9 @@ func (api *PrivateMinerAPI) Start(threads *int) error {
 		log.Info("Updated mining threads", "threads", *threads)
 		th.SetThreads(*threads)
 	}
+
+	// TODO : [HORAE] modify api .
+	//password, _ := console.Stdin.PromptPassword("Please input passphrase of : ")
 	// Start the miner and return
 	if !api.e.IsMining() {
 		// Propagate the initial price point to the transaction pool
@@ -119,7 +122,7 @@ func (api *PrivateMinerAPI) Start(threads *int) error {
 		price := api.e.gasPrice
 		api.e.lock.RUnlock()
 		api.e.txPool.SetGasPrice(price)
-		return api.e.StartMining(true)
+		return api.e.StartMining(true, "")
 	}
 	return nil
 }

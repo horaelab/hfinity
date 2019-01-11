@@ -92,7 +92,7 @@ func newTester() *fetcherTester {
 		blocks: map[common.Hash]*types.Block{genesis.Hash(): genesis},
 		drops:  make(map[string]bool),
 	}
-	tester.fetcher = New(tester.getBlock, tester.verifyHeader, tester.broadcastBlock, tester.chainHeight, tester.insertChain, tester.dropPeer)
+	tester.fetcher = New(tester.getBlock, tester.verifyHeader, tester.broadcastBlock, tester.chainHeight, tester.insertChain, tester.dropPeer, tester.rbHeight)
 	tester.fetcher.Start()
 
 	return tester
@@ -121,6 +121,10 @@ func (f *fetcherTester) chainHeight() uint64 {
 	defer f.lock.RUnlock()
 
 	return f.blocks[f.hashes[len(f.hashes)-1]].NumberU64()
+}
+
+func (f *fetcherTester) rbHeight() uint64 {
+	return f.chainHeight() + 1
 }
 
 // insertChain injects a new blocks into the simulated chain.

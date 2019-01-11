@@ -35,6 +35,17 @@ var (
 	ErrInvalidSig = errors.New("invalid transaction v, r, s values")
 )
 
+const (
+	TRANSACTION_TYPE_UNKNOWN            = 0x00
+	TRANSACTION_TYPE_NEW_NODE           = 0x01
+	TRANSACTION_TYPE_GROUP_SHARE_REPORT = 0x02
+
+	//Local tx types
+	TRANSACTION_TYPE_JOINED_NODE    = 0x81
+	TRANSACTION_TYPE_BUILD_GROUP    = 0x82
+	TRANSACTION_TYPE_PREPARED_GROUP = 0x83
+)
+
 type Transaction struct {
 	data txdata
 	// caches
@@ -58,6 +69,8 @@ type txdata struct {
 
 	// This is only used when marshaling to JSON.
 	Hash *common.Hash `json:"hash" rlp:"-"`
+
+	TxTypeCode uint64 `json:"type" gencodec:"required"`
 }
 
 type txdataMarshaling struct {
@@ -72,14 +85,18 @@ type txdataMarshaling struct {
 }
 
 func NewTransaction(nonce uint64, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
-	return newTransaction(nonce, &to, amount, gasLimit, gasPrice, data)
+	return newTransaction(nonce, &to, amount, gasLimit, gasPrice, data, 0)
+}
+
+func NewTx(nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte, txType uint64) *Transaction {
+	return newTransaction(nonce, nil, amount, gasLimit, gasPrice, data, txType)
 }
 
 func NewContractCreation(nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
-	return newTransaction(nonce, nil, amount, gasLimit, gasPrice, data)
+	return newTransaction(nonce, nil, amount, gasLimit, gasPrice, data, 0)
 }
 
-func newTransaction(nonce uint64, to *common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
+func newTransaction(nonce uint64, to *common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte, txType uint64) *Transaction {
 	if len(data) > 0 {
 		data = common.CopyBytes(data)
 	}
@@ -89,6 +106,7 @@ func newTransaction(nonce uint64, to *common.Address, amount *big.Int, gasLimit 
 		Payload:      data,
 		Amount:       new(big.Int),
 		GasLimit:     gasLimit,
+		TxTypeCode:   txType,
 		Price:        new(big.Int),
 		V:            new(big.Int),
 		R:            new(big.Int),
@@ -168,6 +186,7 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 }
 
 func (tx *Transaction) Data() []byte       { return common.CopyBytes(tx.data.Payload) }
+func (tx *Transaction) Type() uint64       { return tx.data.TxTypeCode }
 func (tx *Transaction) Gas() uint64        { return tx.data.GasLimit }
 func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.data.Price) }
 func (tx *Transaction) Value() *big.Int    { return new(big.Int).Set(tx.data.Amount) }

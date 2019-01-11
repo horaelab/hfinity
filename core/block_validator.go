@@ -22,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -33,6 +34,7 @@ type BlockValidator struct {
 	config *params.ChainConfig // Chain configuration options
 	bc     *BlockChain         // Canonical block chain
 	engine consensus.Engine    // Consensus engine used for validating
+	signer types.Signer
 }
 
 // NewBlockValidator returns a new block validator which is safe for re-use
@@ -41,6 +43,7 @@ func NewBlockValidator(config *params.ChainConfig, blockchain *BlockChain, engin
 		config: config,
 		engine: engine,
 		bc:     blockchain,
+		signer: types.NewEIP155Signer(config.ChainID),
 	}
 	return validator
 }
@@ -69,6 +72,122 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	}
 	if hash := types.DeriveSha(block.Transactions()); hash != header.TxHash {
 		return fmt.Errorf("transaction root hash mismatch: have %x, want %x", hash, header.TxHash)
+	}
+	if err := v.ValidateTransaction(block); err != nil {
+		return fmt.Errorf("invalid transactions: err : %s", err.Error())
+	}
+	return nil
+}
+
+func (v *BlockValidator) ValidateTransaction(block *types.Block) error {
+	if v.bc.replicaDb == nil {
+		return nil
+	}
+	replicas := make(map[uint64]*replica.Replica, 0)
+	groups := make(map[uint64]*replica.Group, 0)
+	preparedGroup := make(map[uint64]*replica.Group, 0)
+	for _, tx := range block.Transactions() {
+		if !v.bc.CheckEpoch(block.NumberU64()) && tx.Type()>>7 == 1 {
+			continue
+		}
+		switch tx.Type() {
+		case types.TRANSACTION_TYPE_JOINED_NODE:
+			r := replica.DeserializeReplica(tx.Data())
+			if r == nil {
+				return fmt.Errorf("invalid join node tranaction, txHash: %x", tx.Hash())
+			}
+			if replicas[r.Id] != nil {
+				return fmt.Errorf("duplicate replica id of the join node txs, id: %d", r.Id)
+			}
+			replicas[r.Id] = r
+		case types.TRANSACTION_TYPE_NEW_NODE:
+			from, _ := types.Sender(v.signer, tx)
+			r := replica.DeserializeReplica(tx.Data())
+			if r == nil || r.Address != from {
+				return fmt.Errorf("invalid new node transaction, from : %s", from.Hex())
+			}
+		case types.TRANSACTION_TYPE_BUILD_GROUP:
+			group := replica.DeserializeGroup(tx.Data())
+			if group == nil {
+				return fmt.Errorf("invalid build group tx, txHash :%x", tx.Hash())
+			}
+			if groups[group.Index] != nil {
+				return fmt.Errorf("duplicate group id of the build group txs, id: %d", group.Index)
+			}
+			groups[group.Index] = group
+		case types.TRANSACTION_TYPE_PREPARED_GROUP:
+			group := replica.DeserializeGroup(tx.Data())
+			if group == nil {
+				return fmt.Errorf("invalid build group tx, txHash :%x", tx.Hash())
+			}
+			if preparedGroup[group.Index] != nil && preparedGroup[group.Index].Hash() != group.Hash() {
+				return fmt.Errorf("duplicate group id of the build group txs, id: %d", group.Index)
+			}
+			preparedGroup[group.Index] = group
+		case types.TRANSACTION_TYPE_GROUP_SHARE_REPORT:
+			groupShareReport := replica.DeserializeGroupShareReport(tx.Data())
+			if groupShareReport == nil {
+				return fmt.Errorf("invalid group share report tx, txHash :%x", tx.Hash())
+			}
+			from, _ := types.Sender(v.signer, tx)
+			if from != groupShareReport.From || groupShareReport.Epoch != block.Epoch() {
+				return fmt.Errorf("invalid group share report tx")
+			}
+		}
+	}
+	if err := v.validateReplicas(replicas, block); err != nil {
+		return fmt.Errorf("invalid join node transaction, err: %s", err.Error())
+	}
+	if err := v.validateGroups(groups, block, replicas); err != nil {
+		return fmt.Errorf("invalid build group transaction, err: %s", err.Error())
+	}
+	if err := v.validatePreparedGroups(preparedGroup, block); err != nil {
+		return fmt.Errorf("invalid prepared group transaction, err: %s", err.Error())
+	}
+	return nil
+}
+
+func (v *BlockValidator) validateReplicas(replicas map[uint64]*replica.Replica, block *types.Block) error {
+	parent := v.bc.GetBlockByHash(block.ParentHash())
+	if uint64(len(replicas)) != block.ReplicaNum()-parent.ReplicaNum() {
+		return fmt.Errorf("new replicas size mismatch. have: %d, want: %d", len(replicas), block.ReplicaNum()-parent.ReplicaNum())
+	}
+	if v.bc.CheckEpoch(block.NumberU64()) {
+		newNodes := v.bc.GetUnconfirmedReplica(parent.Hash())
+		for i := parent.ReplicaNum() + 1; i < block.ReplicaNum(); i++ {
+			if replicas[i] == nil || replicas[i].HashWithoutId() != newNodes[replicas[i].Address].HashWithoutId() {
+				return fmt.Errorf("invalid replica. id: %d", i)
+			}
+		}
+	}
+	return nil
+}
+
+func (v *BlockValidator) validateGroups(groups map[uint64]*replica.Group, block *types.Block, newReplicas map[uint64]*replica.Replica) error {
+	if !v.bc.CheckEpoch(block.NumberU64()) {
+		return nil
+	}
+	block.Header().Hash()
+	parent := v.bc.GetBlockByHash(block.ParentHash())
+	groupsInfo := v.bc.GenerateGroupsInfo(block.Header(), parent.ReplicaNum(), newReplicas)
+	for _, groupInfo := range groupsInfo {
+		if groupInfo.HashWithoutKey() != groups[groupInfo.Index].HashWithoutKey() {
+			return fmt.Errorf("invalid group members of group %d", groupInfo.Index)
+		}
+	}
+	return nil
+}
+
+func (v *BlockValidator) validatePreparedGroups(groups map[uint64]*replica.Group, block *types.Block) error {
+	if !v.bc.CheckEpoch(block.NumberU64()) {
+		return nil
+	}
+	groupShareReports := v.bc.GetUnconfirmedGroupShareReport(block.ParentHash())
+	for index, group := range groups {
+		expectGroup := v.bc.BuildGroup(index, block.Epoch()-1, groupShareReports[index])
+		if group.Hash() != expectGroup.Hash() {
+			return fmt.Errorf("invalid prepared group. groupIndex: %d", group.Index)
+		}
 	}
 	return nil
 }

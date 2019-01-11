@@ -352,6 +352,11 @@ var (
 		Usage: "Password file to use for non-interactive password input",
 		Value: "",
 	}
+	EbPasswordFileFlag = cli.StringFlag{
+		Name:  "ebpassword",
+		Usage: "Etherbase password file to use for non-interactive password input",
+		Value: "",
+	}
 
 	VMEnableDebugFlag = cli.BoolFlag{
 		Name:  "vmdebug",
@@ -456,6 +461,16 @@ var (
 		Name:  "port",
 		Usage: "Network listening port",
 		Value: 30303,
+	}
+	IPAddressFlag = cli.StringFlag{
+		Name:  "ipaddress",
+		Usage: "ip address of the node",
+		Value: "127.0.0.1",
+	}
+	BufferDepthFlag = cli.IntFlag{
+		Name:  "bufferDepth",
+		Usage: "depth of unconfirmedBuffer",
+		Value: 5,
 	}
 	BootnodesFlag = cli.StringFlag{
 		Name:  "bootnodes",
@@ -568,6 +583,18 @@ var (
 		Name:  "metrics.influxdb.host.tag",
 		Usage: "InfluxDB `host` tag attached to all measurements",
 		Value: "localhost",
+	}
+
+	//Dfinity flags
+	ProfilingFlag = cli.BoolFlag{
+		Name:  "profiling",
+		Usage: "Enable profiling.",
+	}
+
+	ProfilingPortFlag = cli.IntFlag{
+		Name:  "profiling-port",
+		Usage: "Net profiling listening port",
+		Value: 6060,
 	}
 )
 
@@ -837,6 +864,18 @@ func MakePasswordList(ctx *cli.Context) []string {
 	return lines
 }
 
+func EtherbasePassword(ctx *cli.Context) string {
+	path := ctx.GlobalString(EbPasswordFileFlag.Name)
+	if path == "" {
+		return ""
+	}
+	text, err := ioutil.ReadFile(path)
+	if err != nil {
+		Fatalf("Failed to read password file: %v", err)
+	}
+	return strings.Trim(string(text), "\n")
+}
+
 func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 	setNodeKey(ctx, cfg)
 	setNAT(ctx, cfg)
@@ -1066,6 +1105,12 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 		cfg.SyncMode = downloader.FastSync
 	case ctx.GlobalBool(LightModeFlag.Name):
 		cfg.SyncMode = downloader.LightSync
+	}
+	if ctx.GlobalIsSet(IPAddressFlag.Name) {
+		cfg.IPAddress = ctx.GlobalString(IPAddressFlag.Name)
+	}
+	if ctx.GlobalIsSet(BufferDepthFlag.Name) {
+		cfg.BufferDepth = ctx.GlobalInt(BufferDepthFlag.Name)
 	}
 	if ctx.GlobalIsSet(LightServFlag.Name) {
 		cfg.LightServ = ctx.GlobalInt(LightServFlag.Name)

@@ -357,33 +357,11 @@ func (pool *TxPool) validateTx(ctx context.Context, tx *types.Transaction) error
 		return core.ErrNonceTooLow
 	}
 
-	// Check the transaction doesn't exceed the current
-	// block limit gas.
-	header := pool.chain.GetHeaderByHash(pool.head)
-	if header.GasLimit < tx.Gas() {
-		return core.ErrGasLimit
-	}
-
 	// Transactions can't be negative. This may never happen
 	// using RLP decoded transactions but may occur if you create
 	// a transaction using the RPC for example.
 	if tx.Value().Sign() < 0 {
 		return core.ErrNegativeValue
-	}
-
-	// Transactor should have enough funds to cover the costs
-	// cost == V + GP * GL
-	if b := currentState.GetBalance(from); b.Cmp(tx.Cost()) < 0 {
-		return core.ErrInsufficientFunds
-	}
-
-	// Should supply enough intrinsic gas
-	gas, err := core.IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead)
-	if err != nil {
-		return err
-	}
-	if tx.Gas() < gas {
-		return core.ErrIntrinsicGas
 	}
 	return currentState.Error()
 }

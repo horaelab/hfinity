@@ -25,8 +25,8 @@ import (
 
 // Genesis hashes to enforce below configs on.
 var (
-	MainnetGenesisHash = common.HexToHash("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
-	TestnetGenesisHash = common.HexToHash("0x41941023680923e0fe4d74a34bdac8141f2540e3ae90623718e47d66d1ca4a2d")
+	MainnetGenesisHash = common.HexToHash("0x32e8d3aaf7f9d6a647e790167dd9cd8ae4ebe3f967a0fda9c586efbf2b6738fa")
+	TestnetGenesisHash = common.HexToHash("0xf7a92463330fbb7dc1967413890aaa17eb586bfc35c0193743a6aa67b7b84a56")
 )
 
 var (
@@ -43,6 +43,12 @@ var (
 		ByzantiumBlock:      big.NewInt(4370000),
 		ConstantinopleBlock: nil,
 		Ethash:              new(EthashConfig),
+		BufferDepth:         big.NewInt(5),
+		EpochLength:         big.NewInt(16),
+		GroupSize:           big.NewInt(6),
+		GroupThreshold:      big.NewInt(3),
+		ReplicaThreshold:    big.NewInt(1),
+		FixedGroupNum:       big.NewInt(10),
 	}
 
 	// TestnetChainConfig contains the chain parameters to run a node on the Ropsten test network.
@@ -58,6 +64,11 @@ var (
 		ByzantiumBlock:      big.NewInt(1700000),
 		ConstantinopleBlock: nil,
 		Ethash:              new(EthashConfig),
+		BufferDepth:         big.NewInt(5),
+		EpochLength:         big.NewInt(16),
+		GroupSize:           big.NewInt(6),
+		GroupThreshold:      big.NewInt(3),
+		ReplicaThreshold:    big.NewInt(1),
 	}
 
 	// RinkebyChainConfig contains the chain parameters to run a node on the Rinkeby test network.
@@ -76,6 +87,11 @@ var (
 			Period: 15,
 			Epoch:  30000,
 		},
+		BufferDepth:      big.NewInt(5),
+		EpochLength:      big.NewInt(16),
+		GroupSize:        big.NewInt(6),
+		GroupThreshold:   big.NewInt(3),
+		ReplicaThreshold: big.NewInt(1),
 	}
 
 	// AllEthashProtocolChanges contains every protocol change (EIPs) introduced
@@ -83,16 +99,16 @@ var (
 	//
 	// This configuration is intentionally not using keyed fields to force anyone
 	// adding flags to the config to also have to set these fields.
-	AllEthashProtocolChanges = &ChainConfig{big.NewInt(1337), big.NewInt(0), nil, false, big.NewInt(0), common.Hash{}, big.NewInt(0), big.NewInt(0), big.NewInt(0), nil, new(EthashConfig), nil}
+	AllEthashProtocolChanges = &ChainConfig{big.NewInt(1337), big.NewInt(0), nil, false, big.NewInt(0), common.Hash{}, big.NewInt(0), big.NewInt(0), big.NewInt(0), nil, new(EthashConfig), nil, big.NewInt(5), big.NewInt(16), big.NewInt(6), big.NewInt(3), big.NewInt(1), big.NewInt(2), big.NewInt(1500), big.NewInt(10)}
 
 	// AllCliqueProtocolChanges contains every protocol change (EIPs) introduced
 	// and accepted by the Ethereum core developers into the Clique consensus.
 	//
 	// This configuration is intentionally not using keyed fields to force anyone
 	// adding flags to the config to also have to set these fields.
-	AllCliqueProtocolChanges = &ChainConfig{big.NewInt(1337), big.NewInt(0), nil, false, big.NewInt(0), common.Hash{}, big.NewInt(0), big.NewInt(0), big.NewInt(0), nil, nil, &CliqueConfig{Period: 0, Epoch: 30000}}
+	AllCliqueProtocolChanges = &ChainConfig{big.NewInt(1337), big.NewInt(0), nil, false, big.NewInt(0), common.Hash{}, big.NewInt(0), big.NewInt(0), big.NewInt(0), nil, nil, &CliqueConfig{Period: 0, Epoch: 30000}, big.NewInt(5), big.NewInt(16), big.NewInt(6), big.NewInt(3), big.NewInt(1), big.NewInt(2), big.NewInt(1500), big.NewInt(10)}
 
-	TestChainConfig = &ChainConfig{big.NewInt(1), big.NewInt(0), nil, false, big.NewInt(0), common.Hash{}, big.NewInt(0), big.NewInt(0), big.NewInt(0), nil, new(EthashConfig), nil}
+	TestChainConfig = &ChainConfig{big.NewInt(1), big.NewInt(0), nil, false, big.NewInt(0), common.Hash{}, big.NewInt(0), big.NewInt(0), big.NewInt(0), nil, new(EthashConfig), nil, big.NewInt(5), big.NewInt(16), big.NewInt(6), big.NewInt(3), big.NewInt(1), big.NewInt(2), big.NewInt(1500), big.NewInt(10)}
 	TestRules       = TestChainConfig.Rules(new(big.Int))
 )
 
@@ -122,6 +138,15 @@ type ChainConfig struct {
 	// Various consensus engines
 	Ethash *EthashConfig `json:"ethash,omitempty"`
 	Clique *CliqueConfig `json:"clique,omitempty"`
+
+	BufferDepth      *big.Int `json:"bufferDepth"`
+	EpochLength      *big.Int `json:"epochLength"`
+	GroupSize        *big.Int `json:"groupSize"`
+	GroupThreshold   *big.Int `json:"groupThreshold"`
+	ReplicaThreshold *big.Int `json:"replicaThreshold"`
+	BlockTime        *big.Int `json:"blockTime"`
+	TxsLimit         *big.Int `json:"txsLimit"`
+	FixedGroupNum    *big.Int `json:"fixedGroupNum"`
 }
 
 // EthashConfig is the consensus engine configs for proof-of-work based sealing.

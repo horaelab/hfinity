@@ -37,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/params"
@@ -489,6 +490,22 @@ func NewPublicBlockChainAPI(b Backend) *PublicBlockChainAPI {
 func (s *PublicBlockChainAPI) BlockNumber() hexutil.Uint64 {
 	header, _ := s.b.HeaderByNumber(context.Background(), rpc.LatestBlockNumber) // latest header should always be available
 	return hexutil.Uint64(header.Number.Uint64())
+}
+
+func (s *PublicBlockChainAPI) GetRandomBeacon(ctx context.Context, round *uint64) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	var beacon *horaetypes.RandomBeacon
+	var err error
+	if round == nil {
+		beacon, err = s.b.GetCurrentBeacon(ctx)
+	} else {
+		beacon, err = s.b.GetRandomBeacon(ctx, *round)
+	}
+	if beacon != nil {
+		result["Round"] = hexutil.Uint64(beacon.Round)
+		result["Data"] = hexutil.Bytes(beacon.Data)
+	}
+	return result, err
 }
 
 // GetBalance returns the amount of wei for the given address in the state of the
@@ -1045,6 +1062,12 @@ func (s *PublicTransactionPoolAPI) GetTransactionReceipt(ctx context.Context, ha
 	if tx == nil {
 		return nil, nil
 	}
+	if blockNumber >= s.b.CurrentBlock().NumberU64()-uint64(s.b.BufferDepth()) {
+		return nil, nil
+	}
+	if blockHash != rawdb.ReadCanonicalHash(s.b.ChainDb(), blockNumber) {
+		return nil, nil
+	}
 	receipts, err := s.b.GetReceipts(ctx, blockHash)
 	if err != nil {
 		return nil, err
@@ -1187,9 +1210,9 @@ func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (c
 			return common.Hash{}, err
 		}
 		addr := crypto.CreateAddress(from, tx.Nonce())
-		log.Info("Submitted contract creation", "fullhash", tx.Hash().Hex(), "contract", addr.Hex())
+		log.Debug("Submitted contract creation", "fullhash", tx.Hash().Hex(), "contract", addr.Hex())
 	} else {
-		log.Info("Submitted transaction", "fullhash", tx.Hash().Hex(), "recipient", tx.To())
+		log.Debug("Submitted transaction", "fullhash", tx.Hash().Hex(), "recipient", tx.To())
 	}
 	return tx.Hash(), nil
 }

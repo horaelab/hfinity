@@ -56,6 +56,9 @@ var (
 		utils.IdentityFlag,
 		utils.UnlockedAccountFlag,
 		utils.PasswordFileFlag,
+		utils.EbPasswordFileFlag,
+		utils.IPAddressFlag,
+		utils.BufferDepthFlag,
 		utils.BootnodesFlag,
 		utils.BootnodesV4Flag,
 		utils.BootnodesV5Flag,
@@ -123,6 +126,8 @@ var (
 		utils.GpoPercentileFlag,
 		utils.ExtraDataFlag,
 		configFileFlag,
+		utils.ProfilingFlag,
+		utils.ProfilingPortFlag,
 	}
 
 	rpcFlags = []cli.Flag{
@@ -339,9 +344,13 @@ func startNode(ctx *cli.Context, stack *node.Node) {
 				th.SetThreads(threads)
 			}
 		}
+
 		// Set the gas price to the limits from the CLI and start mining
 		ethereum.TxPool().SetGasPrice(utils.GlobalBig(ctx, utils.GasPriceFlag.Name))
-		if err := ethereum.StartMining(true); err != nil {
+		ethereum.SetNode(stack.Server().Self())
+		go stack.Server().StartTempConnLoop(ethereum.GetProtoManager().TempPeerCh)
+		stack.Server().InitP2pMsgHandler(ethereum.GetProtoManager().GetHandler())
+		if err := ethereum.StartMining(true, utils.EtherbasePassword(ctx)); err != nil {
 			utils.Fatalf("Failed to start mining: %v", err)
 		}
 	}

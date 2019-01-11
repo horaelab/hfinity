@@ -41,7 +41,7 @@ var ProtocolName = "eth"
 var ProtocolVersions = []uint{eth63, eth62}
 
 // ProtocolLengths are the number of implemented message corresponding to different protocol versions.
-var ProtocolLengths = []uint64{17, 8}
+var ProtocolLengths = []uint64{39, 8}
 
 const ProtocolMaxMsgSize = 10 * 1024 * 1024 // Maximum cap on the size of a protocol message
 
@@ -62,6 +62,15 @@ const (
 	NodeDataMsg    = 0x0e
 	GetReceiptsMsg = 0x0f
 	ReceiptsMsg    = 0x10
+
+	//Dfinity Event
+	RandomBeaconMsg         = 0x20
+	PartialRandomBeaconMsg  = 0x21
+	RandomBeaconRequestMsg  = 0x22
+	RandomBeaconResponseMsg = 0x23
+	SigRequestMsg           = 0x24
+	SigResponseMsg          = 0x25
+	GroupShareMsg           = 0x26
 )
 
 type errCode int
@@ -76,6 +85,8 @@ const (
 	ErrNoStatusMsg
 	ErrExtraStatusMsg
 	ErrSuspendedPeer
+	ErrInvalidBeacon
+	ErrInvalidPartialBeacon
 )
 
 func (e errCode) String() string {
@@ -93,11 +104,15 @@ var errorToString = map[int]string{
 	ErrNoStatusMsg:             "No status message",
 	ErrExtraStatusMsg:          "Extra status message",
 	ErrSuspendedPeer:           "Suspended peer",
+	ErrInvalidBeacon:           "Invalid beacon",
+	ErrInvalidPartialBeacon:    "Invalid partial beacon",
 }
 
 type txPool interface {
 	// AddRemotes should add the given transactions to the pool.
 	AddRemotes([]*types.Transaction) []error
+
+	AsyncAddRemotes([]*types.Transaction)
 
 	// Pending should return pending transactions.
 	// The slice should be modifiable by the caller.

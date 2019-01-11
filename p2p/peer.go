@@ -60,6 +60,7 @@ type protoHandshake struct {
 	Name       string
 	Caps       []Cap
 	ListenPort uint64
+	Temporary  bool
 	ID         discover.NodeID
 
 	// Ignore additional fields (for forward compatibility).
@@ -234,6 +235,11 @@ loop:
 	p.rw.close(reason)
 	p.wg.Wait()
 	return remoteRequested, err
+}
+
+func (p *Peer) Close() {
+	close(p.closed)
+	p.rw.fd.Close()
 }
 
 func (p *Peer) pingLoop() {

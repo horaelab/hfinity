@@ -31,6 +31,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/horae/horaetypes"
+	"github.com/ethereum/go-ethereum/horae/replica"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/hashicorp/golang-lru"
@@ -64,6 +66,18 @@ type HeaderChain struct {
 
 	rand   *mrand.Rand
 	engine consensus.Engine
+}
+
+func (hc *HeaderChain) CalcReplicaRating(round uint64, address common.Address) uint64 {
+	panic("implement me")
+}
+
+func (hc *HeaderChain) GetGroupWithBeacon(beacon horaetypes.RandomBeacon) *replica.Group {
+	panic("implement me")
+}
+
+func (hc *HeaderChain) ReplicaDb() ethdb.Database {
+	panic("implement me")
 }
 
 // NewHeaderChain creates a new HeaderChain structure.
@@ -142,7 +156,8 @@ func (hc *HeaderChain) WriteHeader(header *types.Header) (status WriteStatus, er
 	if ptd == nil {
 		return NonStatTy, consensus.ErrUnknownAncestor
 	}
-	localTd := hc.GetTd(hc.currentHeaderHash, hc.CurrentHeader().Number.Uint64())
+	currentHeader := hc.CurrentHeader()
+	localTd := hc.GetTd(currentHeader.Hash(), currentHeader.Number.Uint64())
 	externTd := new(big.Int).Add(header.Difficulty, ptd)
 
 	// Irrelevant of the canonical status, write the td and header to the database
@@ -154,7 +169,14 @@ func (hc *HeaderChain) WriteHeader(header *types.Header) (status WriteStatus, er
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	if externTd.Cmp(localTd) > 0 || (externTd.Cmp(localTd) == 0 && mrand.Float64() < 0.5) {
+	reorg := number > currentHeader.Number.Uint64()
+	reorg = reorg || (number == currentHeader.Number.Uint64() && externTd.Cmp(localTd) > 0)
+	reorg = reorg || (number == currentHeader.Number.Uint64() && header.Difficulty.Cmp(currentHeader.Difficulty) > 0)
+	if !reorg && number == currentHeader.Number.Uint64() && header.Difficulty.Cmp(currentHeader.Difficulty) == 0 {
+		// Split same-difficulty blocks by number, then at random
+		log.Error("Reorg confused.", "currentHeader", currentHeader.Hash(), "newHeader", hash)
+	}
+	if reorg {
 		// Delete any canonical number assignments above the new head
 		batch := hc.chainDb.NewBatch()
 		for i := number + 1; ; i++ {
